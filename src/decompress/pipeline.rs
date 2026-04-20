@@ -702,4 +702,138 @@ mod tests
 		let output = pipeline_decompress(&compressed, 9);
 		assert_eq!(output, original);
 	}
+
+	// ── Coverage gap tests: false-positive merge-and-retry ─────────
+
+	/// Inject a fake Block candidate into the middle of a real block,
+	/// causing two consecutive failures that must be merged and retried.
+	#[test]
+	fn test_pipeline_false_positive_merged()
+	{
+		// Compress data large enough for a single real block.
+		let line = "False positive merge test data. ";
+		let original: Vec<u8> = line.as_bytes().iter().copied().cycle().take(2048).collect();
+		let compressed = compress(&original, 9);
+		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+
+		let scanner = Scanner::new();
+		let mut candidates = scanner.scan(&data);
+
+		// Find the real block and EOS.
+		let block_candidates: Vec<_> = candidates.iter().filter(|c| c.marker_type == MarkerType::Block).collect();
+		let eos_candidate = candidates.iter().find(|c| c.marker_type == MarkerType::Eos).unwrap();
+		assert_eq!(block_candidates.len(), 1, "need exactly 1 real block");
+
+		// Inject a fake Block candidate halfway between the real block and EOS.
+		let fake_bit = (block_candidates[0].bit_offset + eos_candidate.bit_offset) / 2;
+		// Round to byte boundary to avoid collisions.
+		let fake_bit = (fake_bit / 8) * 8;
+		candidates.push(Candidate { bit_offset: fake_bit, marker_type: MarkerType::Block });
+		candidates.sort();
+
+		// The pipeline should: fail on both sub-ranges, merge [real_start, eos),
+		// and succeed on the merged range.
+		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default()).unwrap();
+		let mut output = Vec::new();
+		while let Some(result) = pipeline.recv() {
+			let block = result.unwrap();
+			output.extend_from_slice(&block.data);
+		}
+		assert_eq!(output, original);
+	}
+
+	/// Inject a fake Block candidate after the last real block (before EOS),
+	/// causing a trailing failure group that must be merged with EOS.
+	#[test]
+	fn test_pipeline_false_positive_trailing()
+	{
+		let original = b"Trailing false positive test data for pipeline coverage.";
+		let compressed = compress(original, 9);
+		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+
+		let scanner = Scanner::new();
+		let mut candidates = scanner.scan(&data);
+
+		let eos_candidate = *candidates.iter().find(|c| c.marker_type == MarkerType::Eos).unwrap();
+
+		// Inject a fake Block candidate near the EOS (but before it).
+		let fake_bit = eos_candidate.bit_offset - 16;
+		let fake_bit = (fake_bit / 8) * 8;
+		candidates.push(Candidate { bit_offset: fake_bit, marker_type: MarkerType::Block });
+		candidates.sort();
+
+		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default()).unwrap();
+		let mut output = Vec::new();
+		while let Some(result) = pipeline.recv() {
+			let block = result.unwrap();
+			output.extend_from_slice(&block.data);
+		}
+		assert_eq!(output, original);
+	}
+
+	/// Multi-block file with a fake candidate injected between two real blocks.
+	/// Tests resolve_failure_group() where a success follows the failure group.
+	#[test]
+	fn test_pipeline_false_positive_between_real_blocks()
+	{
+		// ~250KB random at level 1 → forces multiple real blocks.
+		let mut rng: u64 = 0xC0DE_CAFE;
+		let original: Vec<u8> = (0..250_000)
+			.map(|_| {
+				rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+				(rng >> 33) as u8
+			})
+			.collect();
+
+		let compressed = compress(&original, 1);
+		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+
+		let scanner = Scanner::new();
+		let mut candidates = scanner.scan(&data);
+
+		let blocks: Vec<_> = candidates.iter().filter(|c| c.marker_type == MarkerType::Block).copied().collect();
+		assert!(blocks.len() >= 2, "need ≥2 real blocks, got {}", blocks.len());
+
+		// Inject a fake block halfway between the first two real blocks.
+		let fake_bit = (blocks[0].bit_offset + blocks[1].bit_offset) / 2;
+		let fake_bit = (fake_bit / 8) * 8;
+		candidates.push(Candidate { bit_offset: fake_bit, marker_type: MarkerType::Block });
+		candidates.sort();
+
+		let pipeline = DecompressPipeline::start(data, candidates, 1, PipelineConfig::default()).unwrap();
+		let mut output = Vec::new();
+		while let Some(result) = pipeline.recv() {
+			let block = result.unwrap();
+			output.extend_from_slice(&block.data);
+		}
+		assert_eq!(output, original);
+	}
+
+	/// Test the validator early-return path when reader drops mid-stream (line 292).
+	#[test]
+	fn test_pipeline_validator_early_return()
+	{
+		// Multi-block, drop after receiving first block.
+		let mut rng: u64 = 0xBEEF_F00D;
+		let original: Vec<u8> = (0..250_000)
+			.map(|_| {
+				rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+				(rng >> 33) as u8
+			})
+			.collect();
+
+		let compressed = compress(&original, 1);
+		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+
+		let scanner = Scanner::new();
+		let candidates = scanner.scan(&data);
+
+		let config = PipelineConfig { result_channel_cap: 1, output_channel_cap: 1 };
+		let pipeline = DecompressPipeline::start(data, candidates, 1, config).unwrap();
+
+		// Consume only one block, then drop — validator should exit cleanly.
+		let first = pipeline.recv();
+		assert!(first.is_some());
+		drop(pipeline); // Should not hang or panic.
+	}
 }

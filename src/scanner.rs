@@ -514,4 +514,126 @@ mod tests
 			);
 		}
 	}
+
+	// ── Coverage gap tests ─────────────────────────────────────────
+
+	#[test]
+	fn test_scan_shifted_match_at_start_cant_look_back()
+	{
+		// Shifted match where match_byte_in_chunk==0 && start==0 → continue (line 197).
+		// Place a shifted magic so the inner bytes start at byte 0.
+		// For shift>0, the inner 5-byte pattern would need to match at chunk[0],
+		// but looking back one byte is impossible.
+		let scanner = Scanner::new();
+
+		// Build the 5 inner bytes for block magic at shift=4.
+		let shifted = BLOCK_MAGIC << (64 - 48 - 4);
+		let bytes = shifted.to_be_bytes();
+		let inner = &bytes[1..6]; // 5 inner bytes
+
+		// Place inner bytes at data[0..5]. The scanner finds a match at
+		// match_byte_in_chunk=0, start=0 → can't look back → skip.
+		let mut data = vec![0u8; 20];
+		data[0..5].copy_from_slice(inner);
+
+		let candidates = scanner.scan(&data);
+		// Should NOT find a block at bit offset 4 (can't verify without preceding byte).
+		assert!(
+			!candidates.iter().any(|c| c.bit_offset == 4 && c.marker_type == MarkerType::Block),
+			"should not find shifted match at start of data: {:?}",
+			candidates
+		);
+	}
+
+	#[test]
+	fn test_scan_magic_in_header_region_skipped()
+	{
+		// Magic within the first 32 bits (header region) is skipped (line 206).
+		// Place block magic at bit offset 0 (byte 0).
+		let mut data = vec![0u8; 20];
+		data[0] = 0x31;
+		data[1] = 0x41;
+		data[2] = 0x59;
+		data[3] = 0x26;
+		data[4] = 0x53;
+		data[5] = 0x59;
+
+		let scanner = Scanner::new();
+		let candidates = scanner.scan(&data);
+
+		// Magic at bit 0 is in the header region → skipped.
+		assert!(
+			!candidates.iter().any(|c| c.bit_offset == 0),
+			"should skip magic in header region: {:?}",
+			candidates
+		);
+	}
+
+	#[test]
+	fn test_verify_match_wrong_edge_bits()
+	{
+		// Shifted pattern with correct inner bytes but wrong edge bits → verify_match fails (line 220).
+		let scanner = Scanner::new();
+
+		// Build data where inner bytes match but edge bytes are wrong.
+		let shifted = BLOCK_MAGIC << (64 - 48 - 4);
+		let bytes = shifted.to_be_bytes();
+		let mut data = vec![0u8; 20];
+
+		// Place the full 7-byte window at offset 4, but corrupt the edge bytes.
+		data[4..11].copy_from_slice(&bytes[0..7]);
+		// Corrupt the leading edge byte (has 4 bits of magic + 4 unknown bits).
+		data[4] ^= 0x08; // Flip a bit in the magic portion of the leading byte.
+
+		let candidates = scanner.scan(&data);
+		// The inner bytes still match the AC pattern, but verify_match should reject it.
+		assert!(
+			!candidates.iter().any(|c| c.bit_offset == 36 && c.marker_type == MarkerType::Block),
+			"should reject shifted match with wrong edge bits: {:?}",
+			candidates
+		);
+	}
+
+	#[test]
+	fn test_verify_match_window_past_data_end()
+	{
+		// verify_match where window_start + 7 > data.len() → returns false (line 289).
+		// For this we need data where the inner pattern matches but there aren't
+		// enough bytes for the full 7-byte window.
+		let shifted = BLOCK_MAGIC << (64 - 48 - 4);
+		let bytes = shifted.to_be_bytes();
+
+		// Create data with just enough for header + inner bytes but not the full window.
+		// Inner bytes are bytes[1..6]. Place at byte 5 so window_start=4, window needs 4..11.
+		// If data is only 10 bytes, window_start+7=11 > 10.
+		let mut data = vec![0u8; 10];
+		// Place inner bytes at data[5..10]
+		let inner = &bytes[1..6];
+		data[5..10].copy_from_slice(inner);
+
+		let scanner = Scanner::new();
+		let candidates = scanner.scan(&data);
+
+		// Any shifted match near the end should be rejected by verify_match.
+		assert!(
+			!candidates.iter().any(|c| c.bit_offset == 36 && c.marker_type == MarkerType::Block),
+			"should reject match with window past data end: {:?}",
+			candidates
+		);
+	}
+
+	#[test]
+	fn test_verify_match_at_match_byte_zero()
+	{
+		// verify_match with match_byte=0 → window_start underflow check (line 287).
+		assert!(!verify_match(&[0u8; 10], 0, 4, BLOCK_MAGIC));
+	}
+
+	#[test]
+	fn test_verify_match_short_window()
+	{
+		// window_start + 7 > data.len() (line 288-289).
+		let data = [0u8; 5];
+		assert!(!verify_match(&data, 1, 4, BLOCK_MAGIC));
+	}
 }

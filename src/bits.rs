@@ -39,8 +39,9 @@ pub fn extract_bits(data: &[u8], start_bit: u64, end_bit: u64, out: &mut Vec<u8>
 			out.extend_from_slice(&data[start_byte..end_byte]);
 		} else {
 			// Partial: copy what's available, zero-pad the rest.
-			let available = data.len().saturating_sub(start_byte);
-			out.extend_from_slice(&data[start_byte..start_byte + available]);
+			let clamped_start = start_byte.min(data.len());
+			let available = (data.len() - clamped_start).min(full_bytes);
+			out.extend_from_slice(&data[clamped_start..clamped_start + available]);
 			out.resize(out.len() + full_bytes - available, 0);
 		}
 		if remaining_bits > 0 {
@@ -575,5 +576,230 @@ mod tests
 		w.write_bits(0xDEADBEEF, 32);
 		assert_eq!(w.bit_len(), 32);
 		assert_eq!(w.as_bytes(), &[0xDE, 0xAD, 0xBE, 0xEF]);
+	}
+
+	// ── Coverage gap tests ─────────────────────────────────────────
+
+	#[test]
+	fn test_extract_bits_aligned_past_data_end()
+	{
+		// Data shorter than the requested range — triggers zero-pad path (lines 41-44).
+		let data = [0xAB, 0xCD];
+		let mut out = Vec::new();
+		// Request 4 bytes (32 bits) from a 2-byte buffer.
+		extract_bits(&data, 0, 32, &mut out);
+		assert_eq!(out, [0xAB, 0xCD, 0x00, 0x00]);
+	}
+
+	#[test]
+	fn test_extract_bits_aligned_remaining_past_end()
+	{
+		// Byte-aligned, remaining bits past data end (line 53).
+		let data = [0xFF];
+		let mut out = Vec::new();
+		// Request 12 bits (1 full byte + 4 remaining) starting at bit 8 (past end).
+		extract_bits(&data, 8, 20, &mut out);
+		assert_eq!(out, [0x00, 0x00]);
+	}
+
+	#[test]
+	fn test_extract_bits_shifted_past_data_end()
+	{
+		// Shifted path with data shorter than range (lines 67, 73-82).
+		let data = [0xAB];
+		let mut out = Vec::new();
+		// Request bits 4..28 (24 bits, shifted) from 1-byte buffer.
+		extract_bits(&data, 4, 28, &mut out);
+		// From bit 4: first byte = (0xAB << 4) | (0 >> 4) = 0xB0
+		// second byte = 0, third byte partial = 0
+		assert_eq!(out, [0xB0, 0x00, 0x00]);
+	}
+
+	#[test]
+	fn test_extract_bits_shifted_remaining_past_end()
+	{
+		// Shifted, remaining bits with hi/lo both past data (lines 73-82).
+		let data = [0xFF, 0xAA];
+		let mut out = Vec::new();
+		// Request bits 4..36 (32 bits, shifted, 4 full bytes) from 2-byte buffer.
+		// Bytes 2,3,4 will be past data end.
+		extract_bits(&data, 4, 36, &mut out);
+		assert_eq!(out.len(), 4);
+		// First byte: (0xFF << 4) | (0xAA >> 4) = 0xFA
+		assert_eq!(out[0], 0xFA);
+		// Second byte: (0xAA << 4) | (0 >> 4) = 0xA0
+		assert_eq!(out[1], 0xA0);
+		// Remaining: zeros
+		assert_eq!(out[2], 0x00);
+		assert_eq!(out[3], 0x00);
+	}
+
+	#[test]
+	fn test_read_u32_at_bit_short_buffer()
+	{
+		// Buffer shorter than 32 bits — extract_bits zero-pads, so we
+		// get partial data in the high bytes.
+		let data = [0xAB, 0xCD];
+		// Reading 32 bits from bit 8: gets 0xCD from data[1], rest zero-padded.
+		assert_eq!(read_u32_at_bit(&data, 8), 0xCD00_0000);
+	}
+
+	#[test]
+	fn test_read_u32_at_bit_empty()
+	{
+		// Empty buffer — zero-padded to 4 bytes = 0.
+		assert_eq!(read_u32_at_bit(&[], 0), 0);
+	}
+
+	#[test]
+	fn test_read_u32_at_bit_past_end()
+	{
+		// Start beyond buffer end — all zero-pad.
+		let data = [0xFF; 4];
+		assert_eq!(read_u32_at_bit(&data, 64), 0);
+	}
+
+	#[test]
+	fn test_bitwriter_default()
+	{
+		// Exercise the Default impl (lines 144-147).
+		let w: BitWriter = Default::default();
+		assert_eq!(w.bit_len(), 0);
+		assert!(w.as_bytes().is_empty());
+	}
+
+	#[test]
+	fn test_bitwriter_write_bytes_empty()
+	{
+		// Empty write_bytes early return (line 192).
+		let mut w = BitWriter::new();
+		w.write_bytes(&[]);
+		assert_eq!(w.bit_len(), 0);
+		assert!(w.as_bytes().is_empty());
+	}
+
+	#[test]
+	fn test_bitwriter_write_bits_zero()
+	{
+		// write_bits with n=0 early return (line 227).
+		let mut w = BitWriter::new();
+		w.write_bits(0xFFFF, 0);
+		assert_eq!(w.bit_len(), 0);
+		assert!(w.as_bytes().is_empty());
+	}
+
+	#[test]
+	fn test_bitwriter_copy_bits_zero()
+	{
+		// copy_bits_from with num_bits=0 early return (line 266).
+		let src = [0xFF, 0xAA];
+		let mut w = BitWriter::new();
+		w.copy_bits_from(&src, 0, 0);
+		assert_eq!(w.bit_len(), 0);
+		assert!(w.as_bytes().is_empty());
+	}
+
+	#[test]
+	fn test_bitwriter_copy_bits_aligned_short_src()
+	{
+		// Path 1 (both aligned), source shorter than full_bytes → zero-pad (line 281).
+		let src = [0xAB];
+		let mut w = BitWriter::new();
+		// Copy 24 bits from a 1-byte source (both aligned).
+		w.copy_bits_from(&src, 0, 24);
+		assert_eq!(w.bit_len(), 24);
+		assert_eq!(w.as_bytes(), &[0xAB, 0x00, 0x00]);
+	}
+
+	#[test]
+	fn test_bitwriter_copy_bits_path3_with_tail()
+	{
+		// Path 3 (both non-aligned) with tail bits (lines 321-325).
+		let src = [0xAB, 0xCD, 0xEF];
+		let mut w = BitWriter::new();
+		w.write_bits(0b101, 3); // Make dst non-aligned
+		// Copy 13 bits (1 full byte + 5 tail bits) from bit 4 of src (src non-aligned too).
+		w.copy_bits_from(&src, 4, 13);
+		assert_eq!(w.bit_len(), 16); // 3 + 13 = 16
+
+		// Stream: 101 + 13 bits from src starting at bit 4
+		// src bits 4..17: from 0xAB=10101011 0xCD=11001101 0xEF
+		//   bit4: 1011 11001101 1 (13 bits) = BCDE shifted... let me compute carefully
+		// src bit 4..12 (8 bits): read_byte_at_bit(src, 4) = (0xAB<<4)|(0xCD>>4) = 0xBC
+		// src bit 12..17 (5 bits): read_byte_at_bit(src, 12) = (0xCD<<4)|(0xEF>>4) = 0xDE
+		//   top 5 bits of 0xDE = 11011 → right-justified = 0b11011 = 27
+		//   write_bits(27, 5)
+		// So stream: 101 + 10111100 + 11011 = 10110111100_11011 = 16 bits
+		// bytes: 10110111 10011011 = 0xB7 0x9B
+		assert_eq!(w.as_bytes(), &[0xB7, 0x9B]);
+	}
+
+	#[test]
+	fn test_bitwriter_copy_bits_path3_full_bytes_only()
+	{
+		// Path 3 (both non-aligned) with only full bytes, no tail (line 312 reserve path).
+		let src = [0xFF, 0x00];
+		let mut w = BitWriter::new();
+		w.write_bits(0b1, 1); // 1 bit → dst non-aligned
+		// Copy exactly 8 bits from aligned source (but dst is non-aligned → path 3).
+		w.copy_bits_from(&src, 0, 8);
+		assert_eq!(w.bit_len(), 9);
+		// Stream: 1 + 11111111 = 1_11111111 = 0xFF, 0x80
+		assert_eq!(w.as_bytes(), &[0xFF, 0x80]);
+	}
+
+	#[test]
+	fn test_bitwriter_write_bits_64()
+	{
+		// Write all 64 bits.
+		let mut w = BitWriter::new();
+		w.write_bits(u64::MAX, 64);
+		assert_eq!(w.bit_len(), 64);
+		assert_eq!(w.as_bytes(), &[0xFF; 8]);
+	}
+
+	#[test]
+	fn test_bitwriter_with_capacity()
+	{
+		let w = BitWriter::with_capacity(128);
+		assert_eq!(w.bit_len(), 0);
+		assert!(w.as_bytes().is_empty());
+	}
+
+	#[test]
+	fn test_extract_bits_shifted_remaining_past_end_nonzero()
+	{
+		// Shifted path where remaining_bits > 0 and bytes are past data end (lines 74-83).
+		let data = [0xAB];
+		let mut out = Vec::new();
+		// Request bits 3..14 (11 bits, shifted): full_bytes=1, remaining_bits=3.
+		// start_byte=0, shift=3.
+		// full byte 0: hi=0xAB, lo=0 → (0xAB<<3)|(0>>5) = 0x58 (01011000... wait)
+		// 0xAB = 10101011. 0xAB << 3 = 01011000 = 0x58 (with wraparound). Actually:
+		// (0xAB << 3) as u8 = (10101011 << 3) & 0xFF = 01011000 = 0x58
+		// lo=0 so 0x58 | 0 = 0x58
+		// remaining byte: byte_idx=0+1=1, past data end: hi=0, lo=0
+		// raw=0, mask=0xE0, push 0
+		extract_bits(&data, 3, 14, &mut out);
+		assert_eq!(out.len(), 2);
+		assert_eq!(out[0], 0x58);
+		assert_eq!(out[1], 0x00);
+	}
+
+	#[test]
+	fn test_extract_bits_shifted_remaining_within_data()
+	{
+		// Shifted path with remaining_bits > 0, bytes available.
+		let data = [0xAB, 0xCD, 0xEF];
+		let mut out = Vec::new();
+		// Request bits 2..13 (11 bits, shifted): full_bytes=1, remaining_bits=3.
+		// start_byte=0, shift=2.
+		// full byte 0: hi=0xAB, lo=0xCD → (0xAB<<2)|(0xCD>>6) = 0xAF
+		// remaining: byte_idx=1, hi=0xCD, lo=0xEF → (0xCD<<2)|(0xEF>>6) = 0x37
+		// mask = 0xE0, pushed = 0x37 & 0xE0 = 0x20
+		extract_bits(&data, 2, 13, &mut out);
+		assert_eq!(out.len(), 2);
+		assert_eq!(out[0], 0xAF);
+		assert_eq!(out[1], 0x20);
 	}
 }

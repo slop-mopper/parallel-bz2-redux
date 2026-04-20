@@ -914,4 +914,109 @@ mod tests
 
 		assert_eq!(output, expected);
 	}
+
+	// ── Coverage gap tests ─────────────────────────────────────────
+
+	#[test]
+	fn test_decoder_stream_crc_mismatch()
+	{
+		// Corrupt the stream CRC bytes → triggers CRC mismatch path (lines 250-258).
+		let original = b"CRC mismatch test data.";
+		let mut compressed = compress(original, 9);
+
+		// The stream CRC is stored right after the EOS magic (0x177245385090).
+		// Find the EOS marker, then corrupt a byte safely in the middle of
+		// the 32-bit CRC (avoiding overlap with EOS magic bits).
+		let scanner = Scanner::new();
+		let candidates = scanner.scan_parallel(&compressed);
+		let eos = candidates.iter().find(|c| c.marker_type == MarkerType::Eos).unwrap();
+
+		// CRC starts at bit eos.bit_offset + 48.
+		// Target the 3rd byte of the CRC (16 bits in) to avoid EOS overlap.
+		let target_bit = eos.bit_offset + 48 + 16;
+		let target_byte = (target_bit / 8) as usize;
+
+		assert!(
+			target_byte < compressed.len(),
+			"CRC byte {target_byte} past end of compressed data (len {})",
+			compressed.len()
+		);
+		compressed[target_byte] ^= 0xFF;
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		let result = decoder.read_to_end(&mut output);
+		assert!(result.is_err(), "should fail with CRC mismatch");
+		let err = result.unwrap_err();
+		assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+		assert!(
+			err.to_string().contains("CRC mismatch") || err.to_string().contains("stream CRC mismatch"),
+			"error message should mention CRC: {}",
+			err
+		);
+	}
+
+	#[test]
+	fn test_decoder_stream_crc_mismatch_disabled()
+	{
+		// Same corruption but with CRC verification disabled → should succeed.
+		let original = b"CRC disabled corruption test.";
+		let mut compressed = compress(original, 9);
+
+		let scanner = Scanner::new();
+		let candidates = scanner.scan_parallel(&compressed);
+		let eos = candidates.iter().find(|c| c.marker_type == MarkerType::Eos).unwrap();
+
+		let target_bit = eos.bit_offset + 48 + 16;
+		let target_byte = (target_bit / 8) as usize;
+		assert!(target_byte < compressed.len());
+		compressed[target_byte] ^= 0xFF;
+
+		let mut decoder = ParBz2Decoder::builder()
+			.verify_stream_crc(false)
+			.from_bytes(Arc::from(compressed))
+			.unwrap();
+		let mut output = Vec::new();
+		// Should succeed since CRC verification is disabled.
+		decoder.read_to_end(&mut output).unwrap();
+		assert_eq!(output, original);
+	}
+
+	#[test]
+	fn test_decoder_pipeline_error_propagation()
+	{
+		// Corrupt compressed block data → triggers pipeline error (lines 244-246).
+		let original = b"Pipeline error propagation test data.";
+		let mut compressed = compress(original, 9);
+
+		// Find the block magic and corrupt the data right after the block CRC.
+		let scanner = Scanner::new();
+		let candidates = scanner.scan_parallel(&compressed);
+		let block = candidates.iter().find(|c| c.marker_type == MarkerType::Block).unwrap();
+
+		// Block CRC is at block.bit_offset + 48, so data starts at +80.
+		// Corrupt bytes in the middle of the block.
+		let data_start_byte = ((block.bit_offset + 80) / 8) as usize;
+		if data_start_byte + 10 < compressed.len() {
+			for i in 0..10 {
+				compressed[data_start_byte + i] ^= 0xFF;
+			}
+		}
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		let result = decoder.read_to_end(&mut output);
+		// Should fail — either DecompressionFailed or CrcMismatch propagated through.
+		assert!(result.is_err(), "should fail with corrupted block data");
+	}
+
+	#[test]
+	fn test_find_streams_trailing_without_eos()
+	{
+		// Blocks without a trailing EOS → error.
+		let candidates = vec![Candidate { bit_offset: 32, marker_type: MarkerType::Block }];
+		let data = b"BZh9xxxxxxxxxxxxxxxx";
+		let result = find_streams(data, &candidates);
+		assert!(matches!(result, Err(Bz2Error::InvalidFormat(_))));
+	}
 }
