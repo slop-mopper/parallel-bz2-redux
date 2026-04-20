@@ -1,0 +1,6 @@
+[alias]
+cov = "llvm-cov"
+cov-text = "llvm-cov --text --show-missing-lines"
+cov-html = "llvm-cov --html"
+cov-branch = "llvm-cov --branch --text --show-missing-lines"
+cov-lcov = "llvm-cov --lcov --output-path lcov.info"

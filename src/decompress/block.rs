@@ -103,6 +103,7 @@ pub fn decompress_block(data: &[u8], block_start_bit: u64, block_end_bit: u64, l
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests
 {
 	use std::io::Write;

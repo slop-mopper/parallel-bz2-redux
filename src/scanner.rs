@@ -301,6 +301,7 @@ fn verify_match(data: &[u8], match_byte: usize, shift: u32, magic: u64) -> bool
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests
 {
 	use super::*;

@@ -12,3 +12,6 @@ crossbeam-channel = "0.5"
 memmap2 = "0.9"
 aho-corasick = "1"
 thiserror = "2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }

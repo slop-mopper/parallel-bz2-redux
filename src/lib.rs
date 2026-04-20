@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: CC0-1.0
 // This file was created entirely or mostly by an AI tool: claude-opus-4-6
 
+// Enable the coverage(off) attribute under cargo-llvm-cov so that
+// test-only helpers don't inflate coverage metrics.
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+
 //! Correct, high-performance parallel bzip2 compression and decompression.
 //!
 //! # Decompression
