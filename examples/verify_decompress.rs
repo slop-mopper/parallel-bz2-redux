@@ -1,5 +1,5 @@
 // examples/verify_decompress.rs
-// SPDX-License-Identifier: CC0-1.0
+// SPDX-License-Identifier: Unlicense
 // This file was created entirely or mostly by an AI tool: claude-opus-4-6
 //
 //! End-to-end verification binary: decompresses bz2 files with both

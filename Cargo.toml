@@ -3,7 +3,8 @@ name = "parallel-bz2-redux"
 version = "0.1.0"
 edition = "2024"
 description = "Correct, high-performance parallel bzip2 compression and decompression"
-license = "CC0-1.0"
+license = "Unlicense"
+readme = "README.md"
 
 [dependencies]
 bzip2 = "0.5"

@@ -1,5 +1,5 @@
 // bits.rs
-// SPDX-License-Identifier: CC0-1.0
+// SPDX-License-Identifier: Unlicense
 // This file was created entirely or mostly by an AI tool: claude-opus-4-6
 
 //! Bit-level extraction and insertion utilities for bzip2 bitstreams.

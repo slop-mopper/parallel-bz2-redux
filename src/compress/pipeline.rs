@@ -1,5 +1,5 @@
 // compress/pipeline.rs
-// SPDX-License-Identifier: CC0-1.0
+// SPDX-License-Identifier: Unlicense
 // This file was created entirely or mostly by an AI tool: claude-opus-4-6
 
 //! Parallel compression pipeline: splitter + Rayon pool + bit assembler.

@@ -1,5 +1,5 @@
 // tests/compress_roundtrip.rs
-// SPDX-License-Identifier: CC0-1.0
+// SPDX-License-Identifier: Unlicense
 // This file was created entirely or mostly by an AI tool: claude-opus-4-6
 //
 // Integration tests: compress with ParBz2Encoder, decompress with both
