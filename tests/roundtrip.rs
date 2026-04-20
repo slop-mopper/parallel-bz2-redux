@@ -194,10 +194,7 @@ fn roundtrip_binary_all_byte_values()
 fn roundtrip_highly_compressible()
 {
 	// Long run of 'a' followed by 'b' — tests RLE.
-	let original: Vec<u8> = std::iter::repeat(b'a')
-		.take(500_000)
-		.chain(std::iter::repeat(b'b').take(500_000))
-		.collect();
+	let original: Vec<u8> = std::iter::repeat_n(b'a', 500_000).chain(std::iter::repeat_n(b'b', 500_000)).collect();
 	let compressed = bz2_compress(&original, 9);
 	let decompressed = par_decompress(&compressed);
 	assert_eq!(decompressed, original);

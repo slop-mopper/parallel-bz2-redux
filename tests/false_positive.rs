@@ -172,9 +172,7 @@ fn magic_at_every_byte_alignment()
 	let mut original = Vec::with_capacity(10_000);
 	for offset in 0..8 {
 		// Pad to desired byte alignment.
-		for _ in 0..offset {
-			original.push(0xAA);
-		}
+		original.extend(std::iter::repeat_n(0xAA, offset));
 		original.extend_from_slice(&block_magic);
 	}
 	// Pad to a reasonable size.

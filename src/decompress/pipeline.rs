@@ -324,10 +324,10 @@ impl Validator
 				let br = result.unwrap();
 
 				// Resolve any pending failure group first.
-				if let Some(fg_start) = self.failure_group_start.take() {
-					if !self.resolve_failure_group(fg_start) {
-						return false;
-					}
+				if let Some(fg_start) = self.failure_group_start.take()
+					&& !self.resolve_failure_group(fg_start)
+				{
+					return false;
 				}
 
 				// Emit the successful block.

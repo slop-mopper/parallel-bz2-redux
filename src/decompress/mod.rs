@@ -104,7 +104,7 @@ fn find_streams(data: &[u8], candidates: &[Candidate]) -> Result<Vec<StreamInfo>
 
 			// Next stream header starts at the next byte boundary after
 			// the EOS marker (48-bit magic + 32-bit CRC + 0–7 padding).
-			header_byte_offset = ((eos_bit + 80 + 7) / 8) as usize;
+			header_byte_offset = (eos_bit + 80).div_ceil(8) as usize;
 		}
 	}
 

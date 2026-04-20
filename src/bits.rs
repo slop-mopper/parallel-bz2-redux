@@ -308,7 +308,7 @@ impl BitWriter
 			}
 		} else {
 			// Path 3: general non-aligned — write_bits byte-at-a-time.
-			let needed = ((self.bit_len + num_bits + 7) / 8) as usize;
+			let needed = (self.bit_len + num_bits).div_ceil(8) as usize;
 			if needed > self.buf.capacity() {
 				self.buf.reserve(needed - self.buf.len());
 			}

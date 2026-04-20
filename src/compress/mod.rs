@@ -186,8 +186,7 @@ impl<W: Write> ParBz2Encoder<W>
 
 		// ── Compress remaining buffered data (partial block) ────────
 		if !self.buffer.is_empty() {
-			let block = compress_block(&self.buffer, self.level)
-				.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+			let block = compress_block(&self.buffer, self.level).map_err(|e| std::io::Error::other(e.to_string()))?;
 			self.output.copy_bits_from(&block.bits, 0, block.bit_len);
 			self.stream_crc = combine_stream_crc(self.stream_crc, block.block_crc);
 			self.buffer.clear();
@@ -231,8 +230,7 @@ impl<W: Write> ParBz2Encoder<W>
 
 		let n_bytes = n_blocks * self.block_size;
 		let chunks: Vec<&[u8]> = self.buffer[..n_bytes].chunks(self.block_size).collect();
-		let blocks = compress_blocks_parallel(&chunks, self.level)
-			.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+		let blocks = compress_blocks_parallel(&chunks, self.level).map_err(|e| std::io::Error::other(e.to_string()))?;
 
 		for block in &blocks {
 			self.output.copy_bits_from(&block.bits, 0, block.bit_len);
@@ -255,10 +253,7 @@ impl<W: Write> Write for ParBz2Encoder<W>
 	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize>
 	{
 		if self.done {
-			return Err(std::io::Error::new(
-				std::io::ErrorKind::Other,
-				"write called after encoder finished",
-			));
+			return Err(std::io::Error::other("write called after encoder finished"));
 		}
 		if buf.is_empty() {
 			return Ok(0);

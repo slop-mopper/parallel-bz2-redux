@@ -90,7 +90,7 @@ pub fn assemble_stream(blocks: &[CompressedBlock], level: u8) -> Vec<u8>
 {
 	// Estimate output size: header(4) + block bytes + EOS/CRC/pad(~11).
 	let total_block_bits: u64 = blocks.iter().map(|b| b.bit_len).sum();
-	let est_bytes = 4 + ((total_block_bits + 7) / 8) as usize + 11;
+	let est_bytes = 4 + total_block_bits.div_ceil(8) as usize + 11;
 	let mut writer = BitWriter::with_capacity(est_bytes);
 
 	// ── Stream header: "BZh" + level digit ─────────────────────────

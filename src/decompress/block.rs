@@ -61,7 +61,7 @@ pub fn decompress_block(data: &[u8], block_start_bit: u64, block_end_bit: u64, l
 	// ── 2. Build a synthetic single-block bzip2 stream. ─────────────────
 	let block_bits = block_end_bit - block_start_bit;
 	// Estimate: 4-byte header + block bytes + 6-byte EOS + 4-byte CRC + 1 pad.
-	let estimated_bytes = 4 + ((block_bits + 7) / 8) as usize + 11;
+	let estimated_bytes = 4 + block_bits.div_ceil(8) as usize + 11;
 	let mut writer = BitWriter::with_capacity(estimated_bytes);
 
 	// Stream header: "BZh" + level digit.

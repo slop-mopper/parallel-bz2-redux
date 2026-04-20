@@ -142,7 +142,7 @@ pub fn compress_block(data: &[u8], level: u8) -> Result<CompressedBlock>
 
 	// ── 7. Extract block bits [bit 32, eos_bit) via BitWriter. ──────
 	let block_bit_len = eos_bit - 32;
-	let mut writer = BitWriter::with_capacity(((block_bit_len + 7) / 8) as usize);
+	let mut writer = BitWriter::with_capacity(block_bit_len.div_ceil(8) as usize);
 	writer.copy_bits_from(&stream, 32, block_bit_len);
 	let bits = writer.into_bytes();
 

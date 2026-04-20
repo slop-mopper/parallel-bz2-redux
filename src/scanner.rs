@@ -15,10 +15,10 @@ use aho_corasick::AhoCorasick;
 use rayon::prelude::*;
 
 /// Block magic: pi digits `0x314159265359` (48 bits).
-const BLOCK_MAGIC: u64 = 0x0031_4159_2653_59;
+const BLOCK_MAGIC: u64 = 0x0000_3141_5926_5359;
 
 /// End-of-stream magic: sqrt(pi) digits `0x177245385090` (48 bits).
-const EOS_MAGIC: u64 = 0x0017_7245_3850_90;
+const EOS_MAGIC: u64 = 0x0000_1772_4538_5090;
 
 /// Chunk size for parallel scanning (1 MB).
 const CHUNK_SIZE: usize = 1024 * 1024;
@@ -74,6 +74,14 @@ pub struct Scanner
 	ac: AhoCorasick,
 	/// For each pattern index (0..16), the (bit_shift, marker_type).
 	pattern_info: Vec<(u32, MarkerType)>,
+}
+
+impl Default for Scanner
+{
+	fn default() -> Self
+	{
+		Self::new()
+	}
 }
 
 impl Scanner
@@ -375,9 +383,7 @@ mod tests
 		let mut data = vec![0u8; 20];
 		let shifted = BLOCK_MAGIC << (64 - 48 - 4);
 		let bytes = shifted.to_be_bytes();
-		for i in 0..7 {
-			data[4 + i] = bytes[i];
-		}
+		data[4..11].copy_from_slice(&bytes[..7]);
 
 		let scanner = Scanner::new();
 		let candidates = scanner.scan(&data);

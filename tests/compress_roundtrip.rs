@@ -254,10 +254,7 @@ fn compress_roundtrip_repeating_pattern()
 fn compress_roundtrip_highly_compressible()
 {
 	// Long runs of same byte — highly compressible.
-	let original: Vec<u8> = std::iter::repeat(b'a')
-		.take(500_000)
-		.chain(std::iter::repeat(b'b').take(500_000))
-		.collect();
+	let original: Vec<u8> = std::iter::repeat_n(b'a', 500_000).chain(std::iter::repeat_n(b'b', 500_000)).collect();
 	let compressed = par_compress(&original, 9);
 	assert_eq!(bz2_decompress(&compressed), original);
 }
