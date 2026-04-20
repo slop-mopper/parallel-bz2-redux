@@ -29,9 +29,11 @@ pub(crate) mod pipeline;
 
 use std::collections::VecDeque;
 use std::io::Read;
+use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
 
+use memmap2::Mmap;
 use rayon::ThreadPool;
 
 use self::pipeline::DecompressPipeline;
@@ -43,6 +45,53 @@ use crate::error::Result;
 use crate::scanner::Candidate;
 use crate::scanner::MarkerType;
 use crate::scanner::Scanner;
+
+// ── DataSource ─────────────────────────────────────────────────────
+
+/// Shared, reference-counted handle to the compressed data.
+///
+/// Either owned in-memory data or a memory-mapped file.  Cheap to
+/// clone (just an `Arc` increment) and dereferences to `&[u8]`.
+#[derive(Clone, Debug)]
+pub(crate) enum DataSource
+{
+	/// Heap-allocated data (from [`std::fs::read`] or user-supplied).
+	Owned(Arc<[u8]>),
+	/// Memory-mapped file.
+	Mapped(Arc<Mmap>),
+}
+
+impl Deref for DataSource
+{
+	type Target = [u8];
+
+	fn deref(&self) -> &[u8]
+	{
+		match self {
+			DataSource::Owned(d) => d,
+			DataSource::Mapped(m) => m,
+		}
+	}
+}
+
+/// Open a file as a [`DataSource`], preferring mmap.
+///
+/// Falls back to [`std::fs::read`] if the file cannot be memory-mapped
+/// (e.g. it is a pipe, device, or on a filesystem that does not support mmap).
+fn open_data_source(path: &Path) -> Result<DataSource>
+{
+	let file = std::fs::File::open(path).map_err(Bz2Error::Io)?;
+
+	// Try mmap first.
+	match unsafe { Mmap::map(&file) } {
+		Ok(mmap) => Ok(DataSource::Mapped(Arc::new(mmap))),
+		Err(_) => {
+			// Mmap failed — fall back to reading the entire file.
+			let data = std::fs::read(path).map_err(Bz2Error::Io)?;
+			Ok(DataSource::Owned(Arc::from(data)))
+		}
+	}
+}
 
 // ── Header parsing ─────────────────────────────────────────────────
 
@@ -140,8 +189,8 @@ fn find_streams(data: &[u8], candidates: &[Candidate]) -> Result<Vec<StreamInfo>
 /// Disable this via [`ParBz2DecoderBuilder::verify_stream_crc`].
 pub struct ParBz2Decoder
 {
-	/// Full compressed data (shared with pipelines via Arc).
-	data: Arc<[u8]>,
+	/// Full compressed data (shared with pipelines).
+	data: DataSource,
 	/// Pipeline configuration (reused for each stream's pipeline).
 	config: PipelineConfig,
 	/// Custom Rayon thread pool (reused for each stream's pipeline).
@@ -168,18 +217,19 @@ impl ParBz2Decoder
 {
 	/// Open a bzip2 file for parallel decompression.
 	///
-	/// Reads the entire file into memory, scans for block boundaries,
-	/// and starts the decompression pipeline.
+	/// Attempts to memory-map the file for lower RSS.  Falls back to
+	/// reading the entire file into memory if mmap is not available
+	/// (e.g. the path is a pipe or special file).
 	pub fn open<P: AsRef<Path>>(path: P) -> Result<Self>
 	{
-		let data = std::fs::read(path.as_ref()).map_err(Bz2Error::Io)?;
-		Self::from_bytes(Arc::from(data))
+		let data = open_data_source(path.as_ref())?;
+		Self::build(data, PipelineConfig::default(), true, None)
 	}
 
 	/// Create a decoder from in-memory compressed data.
 	pub fn from_bytes(data: Arc<[u8]>) -> Result<Self>
 	{
-		Self::build(data, PipelineConfig::default(), true, None)
+		Self::build(DataSource::Owned(data), PipelineConfig::default(), true, None)
 	}
 
 	/// Returns a builder for configuring decompression options.
@@ -190,7 +240,7 @@ impl ParBz2Decoder
 
 	/// Internal constructor shared by all entry points.
 	fn build(
-		data: Arc<[u8]>,
+		data: DataSource,
 		config: PipelineConfig,
 		verify_stream_crc: bool,
 		pool: Option<Arc<ThreadPool>>,
@@ -208,7 +258,7 @@ impl ParBz2Decoder
 		let first = streams.pop_front().expect("find_streams guarantees at least one stream");
 		let stored_stream_crc = first.stored_stream_crc;
 		let pipeline = DecompressPipeline::start(
-			Arc::clone(&data),
+			data.clone(),
 			first.candidates,
 			first.level,
 			config.clone(),
@@ -286,7 +336,7 @@ impl ParBz2Decoder
 				self.stream_crc = 0;
 				self.stored_stream_crc = stream.stored_stream_crc;
 				let pipeline = DecompressPipeline::start(
-					Arc::clone(&self.data),
+					self.data.clone(),
 					stream.candidates,
 					stream.level,
 					self.config.clone(),
@@ -408,16 +458,16 @@ impl ParBz2DecoderBuilder
 	/// Open a bzip2 file for parallel decompression.
 	pub fn open<P: AsRef<Path>>(self, path: P) -> Result<ParBz2Decoder>
 	{
-		let data = std::fs::read(path.as_ref()).map_err(Bz2Error::Io)?;
+		let data = open_data_source(path.as_ref())?;
 		let config = self.resolve_config();
-		ParBz2Decoder::build(Arc::from(data), config, self.verify_stream_crc, self.pool)
+		ParBz2Decoder::build(data, config, self.verify_stream_crc, self.pool)
 	}
 
 	/// Build a decoder from in-memory compressed data.
 	pub fn from_bytes(self, data: Arc<[u8]>) -> Result<ParBz2Decoder>
 	{
 		let config = self.resolve_config();
-		ParBz2Decoder::build(data, config, self.verify_stream_crc, self.pool)
+		ParBz2Decoder::build(DataSource::Owned(data), config, self.verify_stream_crc, self.pool)
 	}
 }
 

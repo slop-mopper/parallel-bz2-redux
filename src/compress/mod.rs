@@ -47,8 +47,13 @@ const EOS_MAGIC: u64 = 0x177245385090;
 /// Parallel bzip2 encoder implementing [`Write`].
 ///
 /// Compresses data using multiple threads via Rayon.  Input is buffered
-/// and compressed in block-sized chunks in parallel as data arrives.
-/// Compressed output is streamed to the inner writer incrementally.
+/// until enough full blocks have accumulated to saturate the thread pool,
+/// then all pending blocks are compressed in parallel.
+///
+/// The number of blocks buffered before triggering parallel compression
+/// is controlled by `min_blocks` (default: number of Rayon threads).
+/// Set it to `1` via the builder if you prefer lower latency at the
+/// cost of serial compression.
 ///
 /// # Usage
 ///
@@ -74,6 +79,10 @@ pub struct ParBz2Encoder<W: Write>
 	level: u8,
 	/// Maximum uncompressed bytes per block at this level.
 	block_size: usize,
+	/// Minimum number of full blocks to accumulate before triggering
+	/// parallel compression.  Defaults to the Rayon thread count so
+	/// that each batch saturates the pool.
+	min_blocks: usize,
 	/// Accumulates uncompressed input until full blocks are ready.
 	buffer: Vec<u8>,
 	/// Running output bitstream, flushed incrementally to inner.
@@ -119,6 +128,7 @@ impl<W: Write> ParBz2Encoder<W>
 			inner: Some(inner),
 			level,
 			block_size,
+			min_blocks: rayon::current_num_threads(),
 			buffer: Vec::new(),
 			output: BitWriter::new(),
 			stream_crc: 0,
@@ -191,7 +201,14 @@ impl<W: Write> ParBz2Encoder<W>
 
 		self.ensure_header();
 
-		// ── Compress remaining buffered data (partial block) ────────
+		// ── Compress all remaining buffered data ───────────────────
+		// First, compress any full blocks in parallel.
+		let saved = self.min_blocks;
+		self.min_blocks = 1;
+		self.compress_pending()?;
+		self.min_blocks = saved;
+
+		// Then compress the remaining partial block (if any) serially.
 		if !self.buffer.is_empty() {
 			let block = compress_block(&self.buffer, self.level).map_err(|e| std::io::Error::other(e.to_string()))?;
 			self.output.copy_bits_from(&block.bits, 0, block.bit_len);
@@ -224,12 +241,12 @@ impl<W: Write> ParBz2Encoder<W>
 		}
 	}
 
-	/// Compress all full blocks in the buffer, streaming output to the
-	/// inner writer incrementally.
+	/// Compress pending blocks when enough have accumulated to
+	/// saturate the thread pool.
 	fn compress_pending(&mut self) -> std::io::Result<()>
 	{
 		let n_blocks = self.buffer.len() / self.block_size;
-		if n_blocks == 0 {
+		if n_blocks < self.min_blocks {
 			return Ok(());
 		}
 
@@ -321,6 +338,7 @@ impl<W: Write> Drop for ParBz2Encoder<W>
 pub struct ParBz2EncoderBuilder
 {
 	level: u8,
+	min_blocks: Option<usize>,
 	pool: Option<Arc<ThreadPool>>,
 }
 
@@ -329,7 +347,7 @@ impl ParBz2EncoderBuilder
 	/// Create a new builder with default settings (level 9).
 	pub fn new() -> Self
 	{
-		Self { level: 9, pool: None }
+		Self { level: 9, min_blocks: None, pool: None }
 	}
 
 	/// Set the compression level (`1`–`9`).
@@ -339,6 +357,21 @@ impl ParBz2EncoderBuilder
 	pub fn level(mut self, level: u8) -> Self
 	{
 		self.level = level;
+		self
+	}
+
+	/// Set the minimum number of full blocks to accumulate before
+	/// triggering parallel compression.
+	///
+	/// Higher values give better thread utilisation at the cost of
+	/// higher memory usage and latency before the first compressed
+	/// bytes appear.  Set to `1` for lowest latency (effectively
+	/// serial compression).
+	///
+	/// Default: number of threads in the Rayon pool (global or custom).
+	pub fn min_blocks(mut self, n: usize) -> Self
+	{
+		self.min_blocks = Some(n.max(1));
 		self
 	}
 
@@ -361,6 +394,10 @@ impl ParBz2EncoderBuilder
 	pub fn build<W: Write>(self, inner: W) -> Result<ParBz2Encoder<W>>
 	{
 		let mut enc = ParBz2Encoder::new(inner, self.level)?;
+		let min_blocks = self
+			.min_blocks
+			.unwrap_or_else(|| self.pool.as_ref().map_or(rayon::current_num_threads(), |p| p.current_num_threads()));
+		enc.min_blocks = min_blocks;
 		enc.pool = self.pool;
 		Ok(enc)
 	}
@@ -846,14 +883,14 @@ mod tests
 	#[test]
 	fn test_encoder_streams_output_incrementally()
 	{
-		// For multi-block data, the encoder should write some output
-		// before finish() is called.
+		// With min_blocks(1), the encoder should write some output
+		// as soon as a full block is ready — before finish() is called.
 		let original = lcg_bytes(0xAAAA, 250_000);
 		let mut output = Vec::new();
-		let mut enc = ParBz2Encoder::new(&mut output, 1).unwrap();
+		let mut enc = ParBz2EncoderBuilder::new().level(1).min_blocks(1).build(&mut output).unwrap();
 		enc.write_all(&original).unwrap();
 
-		// After write_all with 250KB at level 1 (99,981 bytes/block),
+		// After write_all with 250KB at level 1 (block_size bytes/block),
 		// at least 2 full blocks should have been compressed and
 		// streamed to the output.  Check via get_ref().
 		let partial_len = enc.get_ref().len();

@@ -640,7 +640,7 @@ fn encoder_streams_incrementally()
 {
 	let original = lcg_bytes(1000, 500_000);
 	let mut output = Vec::new();
-	let mut enc = ParBz2Encoder::new(&mut output, 1).unwrap();
+	let mut enc = ParBz2EncoderBuilder::new().level(1).min_blocks(1).build(&mut output).unwrap();
 
 	// Write enough data for multiple blocks at level 1.
 	enc.write_all(&original).unwrap();

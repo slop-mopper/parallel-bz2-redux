@@ -37,6 +37,7 @@ use crossbeam_channel::Sender;
 use crossbeam_channel::bounded;
 use rayon::ThreadPool;
 
+use super::DataSource;
 use crate::decompress::block::BlockResult;
 use crate::decompress::block::decompress_block;
 use crate::error::Bz2Error;
@@ -179,7 +180,7 @@ impl DecompressPipeline
 	/// If `pool` is `Some`, block decompression tasks are dispatched on
 	/// the given Rayon thread pool.  Otherwise the global Rayon pool is used.
 	pub fn start(
-		data: Arc<[u8]>,
+		data: DataSource,
 		candidates: Vec<Candidate>,
 		level: u8,
 		config: PipelineConfig,
@@ -202,7 +203,7 @@ impl DecompressPipeline
 		let (output_tx, output_rx) = bounded::<Result<ValidatedBlock>>(config.output_channel_cap);
 
 		let ranges_for_validator = ranges.clone();
-		let data_for_validator = Arc::clone(&data);
+		let data_for_validator = data.clone();
 
 		// ── Dispatcher: Rayon FIFO tasks for each block range ───────
 		let dispatcher_handle = thread::Builder::new()
@@ -210,7 +211,7 @@ impl DecompressPipeline
 			.spawn(move || {
 				let do_work = |s: &rayon::ScopeFifo<'_>| {
 					for range in ranges.iter().copied() {
-						let data = Arc::clone(&data);
+						let data = data.clone();
 						let tx = result_tx.clone();
 						s.spawn_fifo(move |_| {
 							let result = decompress_block(&data, range.start_bit, range.end_bit, level);
@@ -292,7 +293,7 @@ impl Drop for DecompressPipeline
 /// range and re-decompressed (handling false-positive scanner hits).
 struct Validator
 {
-	data: Arc<[u8]>,
+	data: DataSource,
 	ranges: Vec<BlockRange>,
 	level: u8,
 	eos_bit: u64,
@@ -476,7 +477,7 @@ mod tests
 
 	fn pipeline_decompress(compressed: &[u8], level: u8) -> Vec<u8>
 	{
-		let data: Arc<[u8]> = Arc::from(compressed);
+		let data = DataSource::Owned(Arc::from(compressed));
 		let scanner = Scanner::new();
 		let candidates = scanner.scan(&data);
 		let pipeline = DecompressPipeline::start(data, candidates, level, PipelineConfig::default(), None).unwrap();
@@ -609,7 +610,7 @@ mod tests
 			.collect();
 
 		let compressed = compress(&original, 1);
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let candidates = scanner.scan(&data);
@@ -666,7 +667,7 @@ mod tests
 		// blocks doesn't hang or panic.
 		let original: Vec<u8> = vec![0xAA; 4096];
 		let compressed = compress(&original, 9);
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let candidates = scanner.scan(&data);
@@ -686,7 +687,7 @@ mod tests
 		// Minimal channel capacities to stress backpressure.
 		let original = b"Small channel pipeline test.";
 		let compressed = compress(original, 9);
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let candidates = scanner.scan(&data);
@@ -714,7 +715,7 @@ mod tests
 			.collect();
 
 		let compressed = compress(&original, 1);
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let candidates = scanner.scan(&data);
@@ -751,7 +752,7 @@ mod tests
 		let line = "False positive merge test data. ";
 		let original: Vec<u8> = line.as_bytes().iter().copied().cycle().take(2048).collect();
 		let compressed = compress(&original, 9);
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let mut candidates = scanner.scan(&data);
@@ -786,7 +787,7 @@ mod tests
 	{
 		let original = b"Trailing false positive test data for pipeline coverage.";
 		let compressed = compress(original, 9);
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let mut candidates = scanner.scan(&data);
@@ -823,7 +824,7 @@ mod tests
 			.collect();
 
 		let compressed = compress(&original, 1);
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let mut candidates = scanner.scan(&data);
@@ -860,7 +861,7 @@ mod tests
 			.collect();
 
 		let compressed = compress(&original, 1);
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let candidates = scanner.scan(&data);
@@ -900,7 +901,7 @@ mod tests
 		let line = "Corrupt data merge-and-retry error test. ";
 		let original: Vec<u8> = line.as_bytes().iter().copied().cycle().take(4096).collect();
 		let mut compressed = compress(&original, 9);
-		let data_arc: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data_arc = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let mut candidates = scanner.scan(&data_arc);
@@ -919,7 +920,7 @@ mod tests
 		candidates.sort();
 
 		// Use the corrupted data.
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default(), None).unwrap();
 
 		// Should receive an error (merged range also fails to decompress).
@@ -943,7 +944,7 @@ mod tests
 	{
 		let original = b"Trailing failure with corrupt data for emit_error coverage.";
 		let mut compressed = compress(original, 9);
-		let data_arc: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data_arc = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let mut candidates = scanner.scan(&data_arc);
@@ -961,7 +962,7 @@ mod tests
 		candidates.push(Candidate { bit_offset: fake_bit, marker_type: MarkerType::Block });
 		candidates.sort();
 
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default(), None).unwrap();
 
 		let mut got_error = false;
@@ -992,7 +993,7 @@ mod tests
 			.collect();
 
 		let mut compressed = compress(&original, 1);
-		let data_arc: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data_arc = DataSource::Owned(Arc::from(compressed.as_slice()));
 
 		let scanner = Scanner::new();
 		let mut candidates = scanner.scan(&data_arc);
@@ -1008,7 +1009,7 @@ mod tests
 		candidates.push(Candidate { bit_offset: fake_bit, marker_type: MarkerType::Block });
 		candidates.sort();
 
-		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let data = DataSource::Owned(Arc::from(compressed.as_slice()));
 		let pipeline = DecompressPipeline::start(data, candidates, 1, PipelineConfig::default(), None).unwrap();
 
 		// The first block's failure group (block 0 + fake) will fail even after
