@@ -340,6 +340,32 @@ impl BitWriter
 			self.bit_len += (8 - remainder) as u64;
 		}
 	}
+
+	/// Flush all complete bytes to a writer, keeping any trailing partial byte.
+	///
+	/// This enables incremental output: append bits via [`write_bits`],
+	/// [`write_bytes`], or [`copy_bits_from`], then periodically flush
+	/// complete bytes to the underlying writer.  The partial trailing
+	/// byte (0–7 bits) remains in the buffer for the next append.
+	///
+	/// Returns the number of bytes written.
+	pub fn flush_to<W: std::io::Write>(&mut self, w: &mut W) -> std::io::Result<usize>
+	{
+		let complete = (self.bit_len / 8) as usize;
+		if complete == 0 {
+			return Ok(0);
+		}
+		w.write_all(&self.buf[..complete])?;
+		let tail_bits = (self.bit_len % 8) as u32;
+		if tail_bits > 0 {
+			self.buf.copy_within(complete.., 0);
+			self.buf.truncate(1);
+		} else {
+			self.buf.clear();
+		}
+		self.bit_len = tail_bits as u64;
+		Ok(complete)
+	}
 }
 
 #[cfg(test)]
