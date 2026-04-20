@@ -29,14 +29,26 @@ const MAX_LEVEL: u8 = 9;
 const BLOCK_SIZE_UNIT: usize = 100_000;
 
 /// libbzip2 reserves 19 bytes of the block buffer for internal sentinels.
-/// The effective maximum uncompressed bytes per block is
-/// `level * BLOCK_SIZE_UNIT - BLOCK_SENTINEL_OVERHEAD`.
+/// The effective BWT array capacity is `level * BLOCK_SIZE_UNIT - BLOCK_SENTINEL_OVERHEAD`.
 const BLOCK_SENTINEL_OVERHEAD: usize = 19;
 
 /// Maximum uncompressed bytes that fit in a single block at the given level.
+///
+/// libbzip2's BWT buffer holds at most `level * 100_000 - 19` *slots*.
+/// However, the initial RLE pass can expand runs of 4 identical bytes:
+/// 4 input bytes consume 5 BWT slots (the 4 bytes + 1 run-length byte).
+/// In the worst case (input entirely composed of 4-byte runs), the
+/// expansion ratio is 5/4.  To guarantee that any input up to this limit
+/// produces exactly one bzip2 block, we apply the inverse factor (4/5).
+///
+/// This is conservative — real data rarely hits the worst case — but it
+/// guarantees single-block output regardless of input content.
 pub fn max_block_bytes(level: u8) -> usize
 {
-	level as usize * BLOCK_SIZE_UNIT - BLOCK_SENTINEL_OVERHEAD
+	let nblock_max = level as usize * BLOCK_SIZE_UNIT - BLOCK_SENTINEL_OVERHEAD;
+	// Worst-case RLE expansion: 4 input bytes → 5 BWT slots.
+	// Safe input limit = nblock_max * 4 / 5.
+	nblock_max * 4 / 5
 }
 
 /// Result of compressing a single block of data.
@@ -320,7 +332,7 @@ mod tests
 	#[test]
 	fn test_compress_max_block_size()
 	{
-		// Level 1 → max block = 100_000 - 19 = 99_981 bytes.
+		// Level 1 → max block = (100_000 - 19) * 4 / 5 = 79_984 bytes.
 		let max = max_block_bytes(1);
 		let original: Vec<u8> = (0u32..max as u32).map(|i| (i % 251) as u8).collect();
 		assert_eq!(original.len(), max);
@@ -375,7 +387,7 @@ mod tests
 	#[test]
 	fn test_compress_exceeds_block_size()
 	{
-		// Level 1 → max 99,981.  Try max + 1 bytes.
+		// Level 1 → max is max_block_bytes(1).  Try max + 1 bytes.
 		let data = vec![0u8; max_block_bytes(1) + 1];
 		let result = compress_block(&data, 1);
 		assert!(result.is_err());

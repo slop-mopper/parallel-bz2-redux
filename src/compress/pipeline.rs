@@ -217,7 +217,7 @@ mod tests
 	#[test]
 	fn test_split_blocks_exact_boundary()
 	{
-		let max = max_block_bytes(1); // 99,981
+		let max = max_block_bytes(1);
 		let data = vec![0u8; max];
 		let chunks = split_blocks(&data, 1);
 		assert_eq!(chunks.len(), 1);
