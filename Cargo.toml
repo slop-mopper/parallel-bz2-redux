@@ -1,6 +1,6 @@
 [package]
 name = "parallel-bz2-redux"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Correct, high-performance parallel bzip2 compression and decompression"
 repository = "https://github.com/slop-mopper/parallel-bz2-redux"
@@ -10,7 +10,7 @@ keywords = ["bzip2", "parallel", "compression", "decompression", "rayon"]
 categories = ["compression", "concurrency"]
 
 [dependencies]
-bzip2 = "0.5"
+bzip2 = "0.6"
 rayon = "1.10"
 crossbeam-channel = "0.5"
 aho-corasick = "1"
@@ -21,7 +21,7 @@ memmap2 = "0.9"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage_nightly)'] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 indicatif = "0.18"
 lipsum = "0.9"
 
