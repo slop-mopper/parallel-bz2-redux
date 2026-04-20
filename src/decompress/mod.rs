@@ -32,6 +32,8 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
 
+use rayon::ThreadPool;
+
 use self::pipeline::DecompressPipeline;
 pub use self::pipeline::PipelineConfig;
 use crate::bits::read_u32_at_bit;
@@ -142,6 +144,8 @@ pub struct ParBz2Decoder
 	data: Arc<[u8]>,
 	/// Pipeline configuration (reused for each stream's pipeline).
 	config: PipelineConfig,
+	/// Custom Rayon thread pool (reused for each stream's pipeline).
+	pool: Option<Arc<ThreadPool>>,
 	/// Remaining streams to decompress (front = next).
 	streams: VecDeque<StreamInfo>,
 	/// Active pipeline for the current stream, or `None` between streams.
@@ -175,7 +179,7 @@ impl ParBz2Decoder
 	/// Create a decoder from in-memory compressed data.
 	pub fn from_bytes(data: Arc<[u8]>) -> Result<Self>
 	{
-		Self::build(data, PipelineConfig::default(), true)
+		Self::build(data, PipelineConfig::default(), true, None)
 	}
 
 	/// Returns a builder for configuring decompression options.
@@ -185,21 +189,36 @@ impl ParBz2Decoder
 	}
 
 	/// Internal constructor shared by all entry points.
-	fn build(data: Arc<[u8]>, config: PipelineConfig, verify_stream_crc: bool) -> Result<Self>
+	fn build(
+		data: Arc<[u8]>,
+		config: PipelineConfig,
+		verify_stream_crc: bool,
+		pool: Option<Arc<ThreadPool>>,
+	) -> Result<Self>
 	{
 		let scanner = Scanner::new();
-		let candidates = scanner.scan_parallel(&data);
+		let candidates = match &pool {
+			Some(p) => p.install(|| scanner.scan_parallel(&data)),
+			None => scanner.scan_parallel(&data),
+		};
 		let all_streams = find_streams(&data, &candidates)?;
 		let mut streams = VecDeque::from(all_streams);
 
 		// Start the first stream's pipeline immediately.
 		let first = streams.pop_front().expect("find_streams guarantees at least one stream");
 		let stored_stream_crc = first.stored_stream_crc;
-		let pipeline = DecompressPipeline::start(Arc::clone(&data), first.candidates, first.level, config.clone())?;
+		let pipeline = DecompressPipeline::start(
+			Arc::clone(&data),
+			first.candidates,
+			first.level,
+			config.clone(),
+			pool.clone(),
+		)?;
 
 		Ok(Self {
 			data,
 			config,
+			pool,
 			streams,
 			pipeline: Some(pipeline),
 			current_block: Vec::new(),
@@ -271,6 +290,7 @@ impl ParBz2Decoder
 					stream.candidates,
 					stream.level,
 					self.config.clone(),
+					self.pool.clone(),
 				)
 				.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 				self.pipeline = Some(pipeline);
@@ -325,7 +345,8 @@ impl Read for ParBz2Decoder
 #[derive(Debug, Clone)]
 pub struct ParBz2DecoderBuilder
 {
-	config: PipelineConfig,
+	config: Option<PipelineConfig>,
+	pool: Option<Arc<ThreadPool>>,
 	verify_stream_crc: bool,
 }
 
@@ -333,7 +354,7 @@ impl ParBz2DecoderBuilder
 {
 	fn new() -> Self
 	{
-		Self { config: PipelineConfig::default(), verify_stream_crc: true }
+		Self { config: None, pool: None, verify_stream_crc: true }
 	}
 
 	/// Set the pipeline channel capacities.
@@ -342,7 +363,21 @@ impl ParBz2DecoderBuilder
 	/// memory usage and throughput.
 	pub fn pipeline_config(mut self, config: PipelineConfig) -> Self
 	{
-		self.config = config;
+		self.config = Some(config);
+		self
+	}
+
+	/// Set a custom Rayon thread pool for parallel decompression.
+	///
+	/// By default the global Rayon pool is used.  Providing a custom pool
+	/// lets you control thread count, stack size, and priority without
+	/// affecting the global pool.
+	///
+	/// If no [`pipeline_config`](Self::pipeline_config) has been set, channel
+	/// capacities are automatically sized for the pool's thread count.
+	pub fn thread_pool(mut self, pool: Arc<ThreadPool>) -> Self
+	{
+		self.pool = Some(pool);
 		self
 	}
 
@@ -357,17 +392,32 @@ impl ParBz2DecoderBuilder
 		self
 	}
 
+	/// Resolve the pipeline config: explicit if set, otherwise sized for
+	/// the custom pool (if any) or the global pool.
+	fn resolve_config(&self) -> PipelineConfig
+	{
+		if let Some(ref config) = self.config {
+			return config.clone();
+		}
+		match &self.pool {
+			Some(p) => PipelineConfig::for_pool(p),
+			None => PipelineConfig::default(),
+		}
+	}
+
 	/// Open a bzip2 file for parallel decompression.
 	pub fn open<P: AsRef<Path>>(self, path: P) -> Result<ParBz2Decoder>
 	{
 		let data = std::fs::read(path.as_ref()).map_err(Bz2Error::Io)?;
-		ParBz2Decoder::build(Arc::from(data), self.config, self.verify_stream_crc)
+		let config = self.resolve_config();
+		ParBz2Decoder::build(Arc::from(data), config, self.verify_stream_crc, self.pool)
 	}
 
 	/// Build a decoder from in-memory compressed data.
 	pub fn from_bytes(self, data: Arc<[u8]>) -> Result<ParBz2Decoder>
 	{
-		ParBz2Decoder::build(data, self.config, self.verify_stream_crc)
+		let config = self.resolve_config();
+		ParBz2Decoder::build(data, config, self.verify_stream_crc, self.pool)
 	}
 }
 
@@ -1019,5 +1069,85 @@ mod tests
 		let data = b"BZh9xxxxxxxxxxxxxxxx";
 		let result = find_streams(data, &candidates);
 		assert!(matches!(result, Err(Bz2Error::InvalidFormat(_))));
+	}
+
+	// ── Custom thread pool ────────────────────────────────────────
+
+	#[test]
+	fn test_decoder_custom_pool_small()
+	{
+		let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+		let original = b"Custom thread pool test data!";
+		let compressed = compress(original, 9);
+
+		let mut decoder = ParBz2Decoder::builder().thread_pool(pool).from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+		assert_eq!(output, original);
+	}
+
+	#[test]
+	fn test_decoder_custom_pool_multi_block()
+	{
+		let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+		let mut rng: u64 = 0xC0FF_EE42;
+		let original: Vec<u8> = (0..250_000)
+			.map(|_| {
+				rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+				(rng >> 33) as u8
+			})
+			.collect();
+		let compressed = compress(&original, 1);
+
+		let mut decoder = ParBz2Decoder::builder().thread_pool(pool).from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+		assert_eq!(output, original);
+	}
+
+	#[test]
+	fn test_decoder_custom_pool_multi_stream()
+	{
+		let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+		let a = b"Pool stream one.";
+		let b_data = b"Pool stream two.";
+		let mut compressed = compress(a, 9);
+		compressed.extend(compress(b_data, 5));
+
+		let mut expected = Vec::new();
+		expected.extend_from_slice(a);
+		expected.extend_from_slice(b_data);
+
+		let mut decoder = ParBz2Decoder::builder().thread_pool(pool).from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+		assert_eq!(output, expected);
+	}
+
+	#[test]
+	fn test_decoder_custom_pool_with_config()
+	{
+		let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+		let config = PipelineConfig { result_channel_cap: 2, output_channel_cap: 1 };
+		let original = b"Pool with custom config.";
+		let compressed = compress(original, 9);
+
+		let mut decoder = ParBz2Decoder::builder()
+			.thread_pool(pool)
+			.pipeline_config(config)
+			.from_bytes(Arc::from(compressed))
+			.unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+		assert_eq!(output, original);
+	}
+
+	#[test]
+	fn test_pipeline_config_for_pool()
+	{
+		let pool = rayon::ThreadPoolBuilder::new().num_threads(3).build().unwrap();
+		let config = PipelineConfig::for_pool(&pool);
+		assert_eq!(config.result_channel_cap, 6); // 3 * 2
+		assert_eq!(config.output_channel_cap, 4);
 	}
 }

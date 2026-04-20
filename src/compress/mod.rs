@@ -26,6 +26,9 @@ pub(crate) mod block;
 pub(crate) mod pipeline;
 
 use std::io::Write;
+use std::sync::Arc;
+
+use rayon::ThreadPool;
 
 use self::block::compress_block;
 pub use self::block::max_block_bytes;
@@ -87,6 +90,8 @@ pub struct ParBz2Encoder<W: Write>
 	done: bool,
 	/// Panic guard: prevents `Drop` from finalizing if a write panicked.
 	panicked: bool,
+	/// Custom Rayon thread pool for parallel block compression.
+	pool: Option<Arc<ThreadPool>>,
 }
 
 impl<W: Write> ParBz2Encoder<W>
@@ -122,6 +127,7 @@ impl<W: Write> ParBz2Encoder<W>
 			total_out: 0,
 			done: false,
 			panicked: false,
+			pool: None,
 		})
 	}
 
@@ -231,7 +237,11 @@ impl<W: Write> ParBz2Encoder<W>
 
 		let n_bytes = n_blocks * self.block_size;
 		let chunks: Vec<&[u8]> = self.buffer[..n_bytes].chunks(self.block_size).collect();
-		let blocks = compress_blocks_parallel(&chunks, self.level).map_err(|e| std::io::Error::other(e.to_string()))?;
+		let blocks = match &self.pool {
+			Some(p) => p.install(|| compress_blocks_parallel(&chunks, self.level)),
+			None => compress_blocks_parallel(&chunks, self.level),
+		}
+		.map_err(|e| std::io::Error::other(e.to_string()))?;
 
 		for block in &blocks {
 			self.output.copy_bits_from(&block.bits, 0, block.bit_len);
@@ -311,6 +321,7 @@ impl<W: Write> Drop for ParBz2Encoder<W>
 pub struct ParBz2EncoderBuilder
 {
 	level: u8,
+	pool: Option<Arc<ThreadPool>>,
 }
 
 impl ParBz2EncoderBuilder
@@ -318,7 +329,7 @@ impl ParBz2EncoderBuilder
 	/// Create a new builder with default settings (level 9).
 	pub fn new() -> Self
 	{
-		Self { level: 9 }
+		Self { level: 9, pool: None }
 	}
 
 	/// Set the compression level (`1`–`9`).
@@ -331,6 +342,17 @@ impl ParBz2EncoderBuilder
 		self
 	}
 
+	/// Set a custom Rayon thread pool for parallel compression.
+	///
+	/// By default the global Rayon pool is used.  Providing a custom pool
+	/// lets you control thread count, stack size, and priority without
+	/// affecting the global pool.
+	pub fn thread_pool(mut self, pool: Arc<ThreadPool>) -> Self
+	{
+		self.pool = Some(pool);
+		self
+	}
+
 	/// Build the encoder, writing compressed output to `inner`.
 	///
 	/// # Errors
@@ -338,7 +360,9 @@ impl ParBz2EncoderBuilder
 	/// Returns [`Bz2Error::InvalidFormat`] if the level is out of range.
 	pub fn build<W: Write>(self, inner: W) -> Result<ParBz2Encoder<W>>
 	{
-		ParBz2Encoder::new(inner, self.level)
+		let mut enc = ParBz2Encoder::new(inner, self.level)?;
+		enc.pool = self.pool;
+		Ok(enc)
 	}
 }
 
@@ -878,5 +902,60 @@ mod tests
 			enc.try_finish().unwrap();
 		}
 		assert_eq!(reference_decompress(&output), original);
+	}
+
+	// ── Custom thread pool ──────────────────────────────────────────
+
+	#[test]
+	fn test_encoder_custom_pool_small()
+	{
+		let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+		let original = b"Custom thread pool encoder test!";
+		let mut output = Vec::new();
+		{
+			let mut enc = ParBz2EncoderBuilder::new().level(9).thread_pool(pool).build(&mut output).unwrap();
+			enc.write_all(original).unwrap();
+			enc.finish().unwrap();
+		}
+		assert_eq!(reference_decompress(&output), original);
+	}
+
+	#[test]
+	fn test_encoder_custom_pool_multi_block()
+	{
+		let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+		let original = lcg_bytes(0xB001_DA7A, 250_000);
+		let mut output = Vec::new();
+		{
+			let mut enc = ParBz2EncoderBuilder::new().level(1).thread_pool(pool).build(&mut output).unwrap();
+			enc.write_all(&original).unwrap();
+			enc.finish().unwrap();
+		}
+		let decompressed = reference_decompress(&output);
+		assert_eq!(decompressed, original);
+	}
+
+	#[test]
+	fn test_encoder_custom_pool_roundtrip()
+	{
+		let pool = Arc::new(rayon::ThreadPoolBuilder::new().num_threads(2).build().unwrap());
+		let original = b"Pool roundtrip: our encoder -> our decoder.";
+		let mut compressed = Vec::new();
+		{
+			let mut enc = ParBz2EncoderBuilder::new()
+				.level(9)
+				.thread_pool(pool.clone())
+				.build(&mut compressed)
+				.unwrap();
+			enc.write_all(original).unwrap();
+			enc.finish().unwrap();
+		}
+		let mut decoder = crate::decompress::ParBz2Decoder::builder()
+			.thread_pool(pool)
+			.from_bytes(Arc::from(compressed))
+			.unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+		assert_eq!(output, original);
 	}
 }

@@ -31,3 +31,4 @@ pub use compress::ParBz2Encoder;
 pub use compress::ParBz2EncoderBuilder;
 pub use decompress::ParBz2Decoder;
 pub use decompress::ParBz2DecoderBuilder;
+pub use rayon::ThreadPool;

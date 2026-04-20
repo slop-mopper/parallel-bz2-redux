@@ -35,6 +35,7 @@ use std::thread;
 use crossbeam_channel::Receiver;
 use crossbeam_channel::Sender;
 use crossbeam_channel::bounded;
+use rayon::ThreadPool;
 
 use crate::decompress::block::BlockResult;
 use crate::decompress::block::decompress_block;
@@ -67,6 +68,19 @@ pub struct PipelineConfig
 	/// Capacity of the output channel (validator → reader).
 	/// Default: `4`.
 	pub output_channel_cap: usize,
+}
+
+impl PipelineConfig
+{
+	/// Create a config with channel capacities sized for the given thread pool.
+	///
+	/// Equivalent to [`Default::default()`] but uses the pool's thread count
+	/// instead of the global Rayon pool's.
+	pub fn for_pool(pool: &ThreadPool) -> Self
+	{
+		let threads = pool.current_num_threads();
+		Self { result_channel_cap: threads * 2, output_channel_cap: 4 }
+	}
 }
 
 impl Default for PipelineConfig
@@ -161,7 +175,16 @@ impl DecompressPipeline
 	/// by bit offset (as returned by [`crate::scanner::Scanner::scan`] /
 	/// [`crate::scanner::Scanner::scan_parallel`]).  `level` is the bzip2 compression
 	/// level from the stream header (`1`–`9`).
-	pub fn start(data: Arc<[u8]>, candidates: Vec<Candidate>, level: u8, config: PipelineConfig) -> Result<Self>
+	///
+	/// If `pool` is `Some`, block decompression tasks are dispatched on
+	/// the given Rayon thread pool.  Otherwise the global Rayon pool is used.
+	pub fn start(
+		data: Arc<[u8]>,
+		candidates: Vec<Candidate>,
+		level: u8,
+		config: PipelineConfig,
+		pool: Option<Arc<ThreadPool>>,
+	) -> Result<Self>
 	{
 		let (ranges, eos_bit) = pair_candidates(&candidates)?;
 
@@ -185,7 +208,7 @@ impl DecompressPipeline
 		let dispatcher_handle = thread::Builder::new()
 			.name("bz2-dispatcher".into())
 			.spawn(move || {
-				rayon::scope_fifo(|s| {
+				let do_work = |s: &rayon::ScopeFifo<'_>| {
 					for range in ranges.iter().copied() {
 						let data = Arc::clone(&data);
 						let tx = result_tx.clone();
@@ -198,7 +221,11 @@ impl DecompressPipeline
 					// All clones created; original `result_tx` drops when
 					// this closure returns → channel closes after scope
 					// waits for all tasks.
-				});
+				};
+				match pool {
+					Some(ref p) => p.scope_fifo(do_work),
+					None => rayon::scope_fifo(do_work),
+				}
 			})
 			.expect("failed to spawn dispatcher thread");
 
@@ -452,7 +479,7 @@ mod tests
 		let data: Arc<[u8]> = Arc::from(compressed);
 		let scanner = Scanner::new();
 		let candidates = scanner.scan(&data);
-		let pipeline = DecompressPipeline::start(data, candidates, level, PipelineConfig::default()).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, level, PipelineConfig::default(), None).unwrap();
 		let mut output = Vec::new();
 		while let Some(result) = pipeline.recv() {
 			let block = result.unwrap();
@@ -591,7 +618,7 @@ mod tests
 		let block_count = candidates.iter().filter(|c| c.marker_type == MarkerType::Block).count();
 		assert!(block_count >= 2, "expected ≥2 blocks at level 1, got {block_count}");
 
-		let pipeline = DecompressPipeline::start(data, candidates, 1, PipelineConfig::default()).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 1, PipelineConfig::default(), None).unwrap();
 
 		let mut output = Vec::new();
 		let mut block_indices = Vec::new();
@@ -644,7 +671,7 @@ mod tests
 		let scanner = Scanner::new();
 		let candidates = scanner.scan(&data);
 
-		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default()).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default(), None).unwrap();
 
 		// Read one block (if available) then drop.
 		let _ = pipeline.recv();
@@ -665,7 +692,7 @@ mod tests
 		let candidates = scanner.scan(&data);
 
 		let config = PipelineConfig { result_channel_cap: 1, output_channel_cap: 1 };
-		let pipeline = DecompressPipeline::start(data, candidates, 9, config).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 9, config, None).unwrap();
 
 		let mut output = Vec::new();
 		while let Some(result) = pipeline.recv() {
@@ -693,7 +720,7 @@ mod tests
 		let candidates = scanner.scan(&data);
 
 		let config = PipelineConfig { result_channel_cap: 1, output_channel_cap: 1 };
-		let pipeline = DecompressPipeline::start(data, candidates, 1, config).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 1, config, None).unwrap();
 
 		let mut output = Vec::new();
 		while let Some(result) = pipeline.recv() {
@@ -743,7 +770,7 @@ mod tests
 
 		// The pipeline should: fail on both sub-ranges, merge [real_start, eos),
 		// and succeed on the merged range.
-		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default()).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default(), None).unwrap();
 		let mut output = Vec::new();
 		while let Some(result) = pipeline.recv() {
 			let block = result.unwrap();
@@ -772,7 +799,7 @@ mod tests
 		candidates.push(Candidate { bit_offset: fake_bit, marker_type: MarkerType::Block });
 		candidates.sort();
 
-		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default()).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default(), None).unwrap();
 		let mut output = Vec::new();
 		while let Some(result) = pipeline.recv() {
 			let block = result.unwrap();
@@ -810,7 +837,7 @@ mod tests
 		candidates.push(Candidate { bit_offset: fake_bit, marker_type: MarkerType::Block });
 		candidates.sort();
 
-		let pipeline = DecompressPipeline::start(data, candidates, 1, PipelineConfig::default()).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 1, PipelineConfig::default(), None).unwrap();
 		let mut output = Vec::new();
 		while let Some(result) = pipeline.recv() {
 			let block = result.unwrap();
@@ -839,7 +866,7 @@ mod tests
 		let candidates = scanner.scan(&data);
 
 		let config = PipelineConfig { result_channel_cap: 1, output_channel_cap: 1 };
-		let pipeline = DecompressPipeline::start(data, candidates, 1, config).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 1, config, None).unwrap();
 
 		// Consume only one block, then drop — validator should exit cleanly.
 		let first = pipeline.recv();
@@ -893,7 +920,7 @@ mod tests
 
 		// Use the corrupted data.
 		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
-		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default()).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default(), None).unwrap();
 
 		// Should receive an error (merged range also fails to decompress).
 		let mut got_error = false;
@@ -935,7 +962,7 @@ mod tests
 		candidates.sort();
 
 		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
-		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default()).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default(), None).unwrap();
 
 		let mut got_error = false;
 		while let Some(result) = pipeline.recv() {
@@ -982,7 +1009,7 @@ mod tests
 		candidates.sort();
 
 		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
-		let pipeline = DecompressPipeline::start(data, candidates, 1, PipelineConfig::default()).unwrap();
+		let pipeline = DecompressPipeline::start(data, candidates, 1, PipelineConfig::default(), None).unwrap();
 
 		// The first block's failure group (block 0 + fake) will fail even after
 		// merge.  The pipeline should emit an error for it.
