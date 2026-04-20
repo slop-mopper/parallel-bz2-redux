@@ -105,6 +105,9 @@ pub fn compress_block(data: &[u8], level: u8) -> Result<CompressedBlock>
 		.ok_or_else(|| Bz2Error::InvalidFormat("compress_block: EOS marker not found in compressed output".into()))?;
 
 	// ── 5. Verify the block magic is at bit 32 (after 4-byte header). ──
+	// DEFENSIVE: libbzip2 always emits the block magic immediately after
+	// the 4-byte stream header, so this check cannot fail with a correct
+	// libbzip2 implementation.  Kept as a safety net.
 	if read_48_at_bit(&stream, 32) != BLOCK_MAGIC {
 		return Err(Bz2Error::InvalidFormat(
 			"compress_block: block magic not found at expected position".into(),
@@ -112,8 +115,11 @@ pub fn compress_block(data: &[u8], level: u8) -> Result<CompressedBlock>
 	}
 
 	// ── 6. Verify stored block CRC matches our computed CRC. ────────
-	// If they differ, libbzip2 likely produced multiple blocks (input
-	// exceeded the effective block capacity).
+	// DEFENSIVE: With correct size validation (data.len() ≤ max_block_bytes),
+	// libbzip2 always produces exactly one block, so the stored CRC at
+	// bit 80 always matches our computed CRC.  A mismatch would indicate
+	// multi-block output (exceeded effective block capacity) or a libbzip2
+	// bug.  Kept as a safety net.
 	let stored_crc = read_u32_at_bit(&stream, 80); // bit 32 (header) + 48 (magic) = 80
 	if stored_crc != block_crc {
 		return Err(Bz2Error::InvalidFormat(format!(
@@ -390,5 +396,25 @@ mod tests
 		let result = compress_block(b"test", 10);
 		assert!(result.is_err());
 		assert!(matches!(result.unwrap_err(), Bz2Error::InvalidFormat(_)));
+	}
+
+	// ── find_eos_bit edge cases ─────────────────────────────────────
+
+	#[test]
+	fn test_find_eos_bit_too_short()
+	{
+		// Stream shorter than 80 bits (10 bytes) → None.
+		assert_eq!(find_eos_bit(&[0u8; 9]), None);
+		assert_eq!(find_eos_bit(&[]), None);
+		assert_eq!(find_eos_bit(&[0u8; 5]), None);
+	}
+
+	#[test]
+	fn test_find_eos_bit_no_match()
+	{
+		// 16 bytes of zeros — no EOS magic pattern in any of the 8 candidate positions.
+		assert_eq!(find_eos_bit(&[0u8; 16]), None);
+		// 16 bytes of 0xFF — also no match.
+		assert_eq!(find_eos_bit(&[0xFF; 16]), None);
 	}
 }
