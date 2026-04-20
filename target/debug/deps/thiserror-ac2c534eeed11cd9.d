@@ -1,0 +1,15 @@
+/data/parallel-bz2-redux/target/debug/deps/thiserror-ac2c534eeed11cd9.d: /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/provide.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /data/parallel-bz2-redux/target/debug/build/thiserror-19b743712ddb670a/out/private.rs
+
+/data/parallel-bz2-redux/target/debug/deps/libthiserror-ac2c534eeed11cd9.rlib: /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/provide.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /data/parallel-bz2-redux/target/debug/build/thiserror-19b743712ddb670a/out/private.rs
+
+/data/parallel-bz2-redux/target/debug/deps/libthiserror-ac2c534eeed11cd9.rmeta: /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/provide.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs /home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs /data/parallel-bz2-redux/target/debug/build/thiserror-19b743712ddb670a/out/private.rs
+
+/home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/lib.rs:
+/home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/aserror.rs:
+/home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/display.rs:
+/home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/provide.rs:
+/home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/var.rs:
+/home/opencode/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/thiserror-2.0.18/src/private.rs:
+/data/parallel-bz2-redux/target/debug/build/thiserror-19b743712ddb670a/out/private.rs:
+
+# env-dep:OUT_DIR=/data/parallel-bz2-redux/target/debug/build/thiserror-19b743712ddb670a/out

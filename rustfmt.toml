@@ -1,0 +1,14 @@
+unstable_features = true
+blank_lines_lower_bound = 0
+blank_lines_upper_bound = 10
+brace_style = "AlwaysNextLine"
+hard_tabs = true
+tab_spaces = 4
+max_width = 120
+chain_width = 90
+imports_granularity = "Item"
+group_imports = "StdExternalCrate"
+wrap_comments = true
+comment_width = 110
+struct_lit_width = 60
+struct_variant_width = 60
