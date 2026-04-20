@@ -156,6 +156,4 @@ assert_eq!(&output, b"data to compress");
 
 ## License
 
-This project is released under the
-[CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/)
-public domain dedication.  See [LICENSE.md](LICENSE.md) for the full text.
+This project is released under the [Unlicense](https://unlicense.org/). See [LICENSE.md](LICENSE.md) for the full text.

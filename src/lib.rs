@@ -8,13 +8,27 @@
 
 //! Correct, high-performance parallel bzip2 compression and decompression.
 //!
+//! # Compression
+//!
+//! ```
+//! use std::io::Write;
+//! use parallel_bz2_redux::ParBz2Encoder;
+//!
+//! let mut compressed = Vec::new();
+//! {
+//!     let mut encoder = ParBz2Encoder::new(&mut compressed, 9).unwrap();
+//!     encoder.write_all(b"Hello, parallel bzip2!").unwrap();
+//!     encoder.finish().unwrap();
+//! }
+//! assert_eq!(&compressed[..3], b"BZh");
+//! ```
+//!
 //! # Decompression
 //!
 //! ```no_run
 //! use std::io::Read;
 //! use parallel_bz2_redux::ParBz2Decoder;
 //!
-//! // From a file:
 //! let mut decoder = ParBz2Decoder::open("file.bz2").unwrap();
 //! let mut output = Vec::new();
 //! decoder.read_to_end(&mut output).unwrap();
