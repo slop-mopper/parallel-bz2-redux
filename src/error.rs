@@ -25,9 +25,6 @@ pub enum Bz2Error
 	{
 		offset: u64, stored: u32, computed: u32
 	},
-
-	#[error("memory mapping failed: {0}")]
-	MmapFailed(std::io::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Bz2Error>;
