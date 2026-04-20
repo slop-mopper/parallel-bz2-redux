@@ -21,6 +21,7 @@
 //! ```
 
 pub mod bits;
+pub mod compress;
 pub mod crc;
 pub mod decompress;
 pub mod error;
