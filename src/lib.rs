@@ -20,12 +20,12 @@
 //! decoder.read_to_end(&mut output).unwrap();
 //! ```
 
-pub mod bits;
+pub(crate) mod bits;
 pub mod compress;
-pub mod crc;
+pub(crate) mod crc;
 pub mod decompress;
 pub mod error;
-pub mod scanner;
+pub(crate) mod scanner;
 
 pub use compress::ParBz2Encoder;
 pub use compress::ParBz2EncoderBuilder;

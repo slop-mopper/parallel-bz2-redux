@@ -87,6 +87,7 @@ pub struct ValidatedBlock
 	/// When a contiguous failure group is merged and re-decompressed,
 	/// the resulting block carries the index of the *first* block in
 	/// the group.
+	#[allow(dead_code)] // read by unit tests for ordering verification
 	pub index: usize,
 	/// Decompressed block data.
 	pub data: Vec<u8>,

@@ -123,7 +123,7 @@ fn read_byte_at_bit(src: &[u8], bit_pos: u64) -> u8
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// use parallel_bz2_redux::bits::BitWriter;
 ///
 /// let mut w = BitWriter::new();
@@ -163,6 +163,7 @@ impl BitWriter
 	}
 
 	/// Total number of bits written so far.
+	#[allow(dead_code)] // used by unit tests
 	pub fn bit_len(&self) -> u64
 	{
 		self.bit_len

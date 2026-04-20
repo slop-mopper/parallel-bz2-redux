@@ -8,7 +8,7 @@ use std::io::Read;
 use std::sync::Arc;
 
 use parallel_bz2_redux::ParBz2Decoder;
-use parallel_bz2_redux::decompress::pipeline::PipelineConfig;
+use parallel_bz2_redux::decompress::PipelineConfig;
 
 // ── Helpers ────────────────────────────────────────────────────────
 

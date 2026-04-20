@@ -28,13 +28,14 @@ pub fn bz2_crc32(data: &[u8]) -> u32
 /// Update a running bzip2 CRC-32 with additional data.
 ///
 /// To compute a CRC incrementally:
-/// ```
+/// ```ignore
 /// # use parallel_bz2_redux::crc::{bz2_crc32_init, bz2_crc32_update, bz2_crc32_finalize};
 /// let mut state = bz2_crc32_init();
 /// state = bz2_crc32_update(state, b"hello ");
 /// state = bz2_crc32_update(state, b"world");
 /// let crc = bz2_crc32_finalize(state);
 /// ```
+#[allow(dead_code)] // used by unit tests
 pub fn bz2_crc32_update(state: u32, data: &[u8]) -> u32
 {
 	let mut crc = state;
@@ -45,12 +46,14 @@ pub fn bz2_crc32_update(state: u32, data: &[u8]) -> u32
 }
 
 /// Initial state for incremental CRC-32 computation.
+#[allow(dead_code)] // used by unit tests
 pub fn bz2_crc32_init() -> u32
 {
 	0xFFFF_FFFFu32
 }
 
 /// Finalize an incremental CRC-32 computation.
+#[allow(dead_code)] // used by unit tests
 pub fn bz2_crc32_finalize(state: u32) -> u32
 {
 	!state

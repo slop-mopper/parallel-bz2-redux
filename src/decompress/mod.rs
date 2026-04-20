@@ -24,8 +24,8 @@
 //! let mut decoder = ParBz2Decoder::from_bytes(data).unwrap();
 //! ```
 
-pub mod block;
-pub mod pipeline;
+pub(crate) mod block;
+pub(crate) mod pipeline;
 
 use std::collections::VecDeque;
 use std::io::Read;
@@ -33,7 +33,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use self::pipeline::DecompressPipeline;
-use self::pipeline::PipelineConfig;
+pub use self::pipeline::PipelineConfig;
 use crate::bits::read_u32_at_bit;
 use crate::crc::combine_stream_crc;
 use crate::error::Bz2Error;

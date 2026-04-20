@@ -22,14 +22,15 @@
 //! assert_eq!(&compressed[..3], b"BZh");
 //! ```
 
-pub mod block;
-pub mod pipeline;
+pub(crate) mod block;
+pub(crate) mod pipeline;
 
 use std::io::Write;
 
 use self::block::compress_block;
-use self::block::max_block_bytes;
+pub use self::block::max_block_bytes;
 use self::pipeline::compress_blocks_parallel;
+pub use self::pipeline::compress_parallel;
 use crate::bits::BitWriter;
 use crate::crc::combine_stream_crc;
 use crate::error::Bz2Error;

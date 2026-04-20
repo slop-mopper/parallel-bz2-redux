@@ -13,7 +13,7 @@ use std::sync::Arc;
 use parallel_bz2_redux::ParBz2Decoder;
 use parallel_bz2_redux::ParBz2Encoder;
 use parallel_bz2_redux::ParBz2EncoderBuilder;
-use parallel_bz2_redux::compress::block::max_block_bytes;
+use parallel_bz2_redux::compress::max_block_bytes;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
