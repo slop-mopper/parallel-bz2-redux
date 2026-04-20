@@ -22,14 +22,15 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use indicatif::MultiProgress;
+use indicatif::ProgressBar;
+use indicatif::ProgressStyle;
 use parallel_bz2_redux::ParBz2Decoder;
 
 /// Chunk size for streaming comparison (64 KiB).
 const CHUNK_SIZE: usize = 64 * 1024;
 
 /// Maximum number of files to verify concurrently.
-/// Each file spawns its own thread; this caps the parallelism
-/// to avoid overwhelming the system on huge file lists.
 const MAX_CONCURRENT: usize = 8;
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -54,138 +55,133 @@ impl fmt::Display for HumanBytes
 	}
 }
 
-/// Result of verifying a single file.
-enum VerifyResult
+fn basename(path: &Path) -> &str
 {
-	/// Outputs matched, with total decompressed byte count.
-	Ok
-	{
-		decompressed_bytes: u64,
-		parallel_ms: u128,
-		reference_ms: u128,
-	},
-	/// Mismatch found at the given byte offset.
-	Mismatch
-	{
-		offset: u64
-	},
-	/// Length disagreement: one decoder produced more output than the other.
-	LengthMismatch
-	{
-		parallel_bytes: u64, reference_bytes: u64
-	},
-	/// An error occurred.
-	Error(String),
+	path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
 }
 
-// ── Streaming comparison ───────────────────────────────────────────
+/// Style for the spinner phase (unknown total, e.g. reference decode).
+fn spinner_style() -> ProgressStyle
+{
+	ProgressStyle::with_template("{spinner:.cyan} {prefix}  {msg}").unwrap()
+}
+
+/// Style for the bar phase (known total, e.g. parallel decode / compare).
+fn bar_style() -> ProgressStyle
+{
+	ProgressStyle::with_template(
+		"{spinner:.cyan} {prefix}  {msg}  [{bar:20.green/dim}] {bytes}/{total_bytes} ({percent}%)",
+	)
+	.unwrap()
+	.progress_chars("=> ")
+}
+
+// ── Per-file verification ──────────────────────────────────────────
 
 /// Decompress `path` with both our parallel decoder and the reference
 /// `bzip2` crate, comparing chunks as they are produced.
 ///
-/// This never holds more than ~2 * CHUNK_SIZE of decompressed data at
-/// a time, so it works for arbitrarily large files.
-fn verify_file(path: &Path) -> VerifyResult
+/// Progress is reported on `pb`.
+fn verify_file(path: &Path, pb: &ProgressBar) -> Result<(u64, u128, u128), String>
 {
-	// --- Reference decoder (bzip2 crate, streaming from file) ---
-	let ref_file = match File::open(path) {
-		Ok(f) => f,
-		Err(e) => return VerifyResult::Error(format!("open for ref decoder: {e}")),
-	};
+	// ── Pass 1: reference decode (unknown total) ───────────────
+	pb.set_style(spinner_style());
+	pb.set_message("ref decode");
+	pb.enable_steady_tick(std::time::Duration::from_millis(100));
+
+	let ref_file = File::open(path).map_err(|e| format!("open for ref decoder: {e}"))?;
 	let mut ref_decoder = bzip2::read::BzDecoder::new(BufReader::new(ref_file));
 
-	// Time the reference decompression into a sink to get a speed baseline.
-	// We do two passes: first reference, then parallel, so each gets a
-	// clean timing window without contention.
 	let ref_start = Instant::now();
 	let mut ref_bytes: u64 = 0;
-	let mut ref_buf = vec![0u8; CHUNK_SIZE];
+	let mut buf = vec![0u8; CHUNK_SIZE];
 	loop {
-		match ref_decoder.read(&mut ref_buf) {
+		match ref_decoder.read(&mut buf) {
 			Ok(0) => break,
-			Ok(n) => ref_bytes += n as u64,
-			Err(e) => return VerifyResult::Error(format!("reference decoder: {e}")),
+			Ok(n) => {
+				ref_bytes += n as u64;
+				pb.set_message(format!("ref decode  {}", HumanBytes(ref_bytes)));
+			}
+			Err(e) => return Err(format!("reference decoder: {e}")),
 		}
 	}
 	let reference_ms = ref_start.elapsed().as_millis();
 	drop(ref_decoder);
 
-	// --- Parallel decoder ---
+	// ── Pass 2: parallel decode (total known) ──────────────────
+	pb.set_style(bar_style());
+	pb.set_length(ref_bytes);
+	pb.set_position(0);
+	pb.set_message("par decode");
+
 	let par_start = Instant::now();
-	let mut par_decoder = match ParBz2Decoder::open(path) {
-		Ok(d) => d,
-		Err(e) => return VerifyResult::Error(format!("ParBz2Decoder::open: {e}")),
-	};
+	let mut par_decoder = ParBz2Decoder::open(path).map_err(|e| format!("ParBz2Decoder::open: {e}"))?;
 	let mut par_bytes: u64 = 0;
-	let mut par_buf = vec![0u8; CHUNK_SIZE];
 	loop {
-		match par_decoder.read(&mut par_buf) {
+		match par_decoder.read(&mut buf) {
 			Ok(0) => break,
-			Ok(n) => par_bytes += n as u64,
-			Err(e) => return VerifyResult::Error(format!("parallel decoder: {e}")),
+			Ok(n) => {
+				par_bytes += n as u64;
+				pb.set_position(par_bytes);
+			}
+			Err(e) => return Err(format!("parallel decoder: {e}")),
 		}
 	}
 	let parallel_ms = par_start.elapsed().as_millis();
 	drop(par_decoder);
 
-	// Quick length check.
 	if par_bytes != ref_bytes {
-		return VerifyResult::LengthMismatch { parallel_bytes: par_bytes, reference_bytes: ref_bytes };
+		return Err(format!(
+			"length mismatch: parallel={} reference={}",
+			HumanBytes(par_bytes),
+			HumanBytes(ref_bytes),
+		));
 	}
 
-	// --- Streaming byte-by-byte comparison (third pass) ---
-	// Re-open both decoders for the comparison pass.
-	let ref_file2 = match File::open(path) {
-		Ok(f) => f,
-		Err(e) => return VerifyResult::Error(format!("open for comparison: {e}")),
-	};
+	// ── Pass 3: streaming comparison ───────────────────────────
+	pb.set_position(0);
+	pb.set_message("comparing");
+
+	let ref_file2 = File::open(path).map_err(|e| format!("open for comparison: {e}"))?;
 	let mut ref_dec2 = bzip2::read::BzDecoder::new(BufReader::new(ref_file2));
-	let mut par_dec2 = match ParBz2Decoder::open(path) {
-		Ok(d) => d,
-		Err(e) => return VerifyResult::Error(format!("ParBz2Decoder::open (cmp): {e}")),
-	};
+	let mut par_dec2 = ParBz2Decoder::open(path).map_err(|e| format!("ParBz2Decoder::open (cmp): {e}"))?;
 
 	let mut par_cmp = vec![0u8; CHUNK_SIZE];
 	let mut ref_cmp = vec![0u8; CHUNK_SIZE];
 	let mut offset: u64 = 0;
 
 	loop {
-		let par_n = match read_exact_or_eof(&mut par_dec2, &mut par_cmp) {
-			Ok(n) => n,
-			Err(e) => return VerifyResult::Error(format!("parallel read (cmp): {e}")),
-		};
-		let ref_n = match read_exact_or_eof(&mut ref_dec2, &mut ref_cmp) {
-			Ok(n) => n,
-			Err(e) => return VerifyResult::Error(format!("reference read (cmp): {e}")),
-		};
+		let par_n = read_exact_or_eof(&mut par_dec2, &mut par_cmp).map_err(|e| format!("parallel read (cmp): {e}"))?;
+		let ref_n = read_exact_or_eof(&mut ref_dec2, &mut ref_cmp).map_err(|e| format!("reference read (cmp): {e}"))?;
 
 		if par_n != ref_n {
-			return VerifyResult::LengthMismatch {
-				parallel_bytes: offset + par_n as u64,
-				reference_bytes: offset + ref_n as u64,
-			};
+			return Err(format!(
+				"length mismatch at comparison: parallel={} reference={}",
+				HumanBytes(offset + par_n as u64),
+				HumanBytes(offset + ref_n as u64),
+			));
 		}
 		if par_n == 0 {
 			break;
 		}
 
-		// Compare the chunk.
 		if par_cmp[..par_n] != ref_cmp[..ref_n] {
-			// Find the exact mismatch offset.
 			for i in 0..par_n {
 				if par_cmp[i] != ref_cmp[i] {
-					return VerifyResult::Mismatch { offset: offset + i as u64 };
+					return Err(format!("mismatch at byte offset {}", offset + i as u64));
 				}
 			}
 		}
 		offset += par_n as u64;
+		pb.set_position(offset);
 	}
 
-	VerifyResult::Ok { decompressed_bytes: offset, parallel_ms, reference_ms }
+	pb.finish_and_clear();
+
+	Ok((ref_bytes, parallel_ms, reference_ms))
 }
 
 /// Read exactly `buf.len()` bytes, or fewer only at EOF.
-/// Returns the number of bytes actually read.
 fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> std::io::Result<usize>
 {
 	let mut filled = 0;
@@ -215,59 +211,52 @@ fn main()
 	let failures = AtomicUsize::new(0);
 	let successes = AtomicUsize::new(0);
 
+	let mp = MultiProgress::new();
 	println!("Verifying {total} file(s), up to {MAX_CONCURRENT} concurrently\n");
 
-	// Process files in batches of MAX_CONCURRENT using scoped threads.
-	// Take references so the `move` closures capture Copy-able refs,
-	// not the owned AtomicUsize values.
 	let failures = &failures;
 	let successes = &successes;
+	let mp = &mp;
 
 	for batch in files.chunks(MAX_CONCURRENT) {
+		// Pre-create a progress bar for each file in the batch.
+		let bars: Vec<ProgressBar> = batch
+			.iter()
+			.map(|path| {
+				let pb = mp.add(ProgressBar::new(0));
+				pb.set_style(spinner_style());
+				pb.set_prefix(basename(path).to_string());
+				pb
+			})
+			.collect();
+
 		std::thread::scope(|s| {
 			let handles: Vec<_> = batch
 				.iter()
-				.map(|path| {
+				.zip(bars.iter())
+				.map(|(path, pb)| {
 					s.spawn(move || {
-						let name = path.display();
-						let file_start = Instant::now();
+						let name = basename(path);
+						let compressed_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
-						let compressed_size = match std::fs::metadata(path) {
-							Ok(m) => m.len(),
-							Err(e) => {
-								eprintln!("[FAIL] {name}: cannot stat: {e}");
-								failures.fetch_add(1, Ordering::Relaxed);
-								return;
-							}
-						};
-
-						print_status(&name, compressed_size, "verifying...");
-
-						match verify_file(path) {
-							VerifyResult::Ok { decompressed_bytes, parallel_ms, reference_ms } => {
-								let wall = file_start.elapsed().as_millis();
-								println!(
-									"[ OK ] {name}  compressed={cmp}  decompressed={dec}  \
-									 ref={reference_ms}ms  par={parallel_ms}ms  total={wall}ms",
-									cmp = HumanBytes(compressed_size),
-									dec = HumanBytes(decompressed_bytes),
-								);
+						match verify_file(path, pb) {
+							Ok((decompressed_bytes, parallel_ms, reference_ms)) => {
+								pb.finish_and_clear();
+								mp.suspend(|| {
+									println!(
+										"[ OK ] {name}  compressed={cmp}  decompressed={dec}  \
+										 ref={reference_ms}ms  par={parallel_ms}ms",
+										cmp = HumanBytes(compressed_size),
+										dec = HumanBytes(decompressed_bytes),
+									);
+								});
 								successes.fetch_add(1, Ordering::Relaxed);
 							}
-							VerifyResult::Mismatch { offset } => {
-								eprintln!("[FAIL] {name}: mismatch at byte offset {offset}");
-								failures.fetch_add(1, Ordering::Relaxed);
-							}
-							VerifyResult::LengthMismatch { parallel_bytes, reference_bytes } => {
-								eprintln!(
-									"[FAIL] {name}: length mismatch: parallel={par} reference={rf}",
-									par = HumanBytes(parallel_bytes),
-									rf = HumanBytes(reference_bytes),
-								);
-								failures.fetch_add(1, Ordering::Relaxed);
-							}
-							VerifyResult::Error(msg) => {
-								eprintln!("[FAIL] {name}: {msg}");
+							Err(msg) => {
+								pb.finish_and_clear();
+								mp.suspend(|| {
+									println!("[FAIL] {name}: {msg}");
+								});
 								failures.fetch_add(1, Ordering::Relaxed);
 							}
 						}
@@ -288,9 +277,4 @@ fn main()
 	if fail > 0 {
 		std::process::exit(1);
 	}
-}
-
-fn print_status(name: &impl fmt::Display, compressed_size: u64, status: &str)
-{
-	println!("[    ] {name}  ({cmp})  {status}", cmp = HumanBytes(compressed_size));
 }
