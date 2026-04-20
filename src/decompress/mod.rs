@@ -5,3 +5,4 @@
 //! Parallel bzip2 decompression.
 
 pub mod block;
+pub mod pipeline;

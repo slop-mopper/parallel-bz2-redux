@@ -21,32 +21,69 @@ next candidate, and decompression is retried.
 
 ## Architecture
 
-### Decompression: Speculative Parallel + CRC Validation
+### Decompression: Streaming Speculative Pipeline
+
+The pipeline streams decompressed data through bounded channels so
+that only a small window of blocks is ever in memory, even for
+multi-gigabyte files that decompress to tens of gigabytes.
 
 ```
-[Scanner: 1MB chunks, Aho-Corasick, Rayon pool]
-    | candidates: Vec<(bit_offset, MarkerType)>, reordered by position
+[Scanner: 1MB chunks, Aho-Corasick, Rayon pool]  (one-time, up-front)
+    | candidates: Vec<Candidate>, sorted by bit_offset
     v
 [Candidate pairing: consecutive candidates -> (start, end) block ranges]
-    | all candidate ranges dispatched to Rayon
+    | ranges: Vec<BlockRange>
     v
-[Speculative decompress: Rayon for_each on ALL ranges]
-    | each block: decompress -> compute CRC -> compare with stored CRC
-    | emit (block_idx, data, crc_valid) to result channel
+[Decompress workers: Rayon pool, fed via bounded work channel]
+    | Each worker: decompress_block() -> (block_idx, Result<BlockResult>)
+    | Results sent to bounded result channel (capacity ~2× thread count)
+    | Backpressure: workers block on send when result channel is full
     v
-[Validator thread: sequential, receives results in order]
-    | CRC valid -> emit to reader buffer
-    | CRC invalid -> discard speculative result, merge with next range,
-    |                re-decompress extended range (rare path)
+[Validator thread: dedicated, processes results in block-index order]
+    | Reorder buffer: HashMap<usize, Result<BlockResult>>
+    | Wait for next expected index, then:
+    |   CRC valid   -> send (block_idx, data) to output channel
+    |   CRC invalid -> accumulate into contiguous failure group;
+    |                  when next success arrives, merge failure
+    |                  group into one range, re-decompress, emit
+    | Bounded output channel (capacity ~4 blocks) provides backpressure
     v
-[Reader: HashMap<idx, Vec<u8>> reorder -> Read trait]
+[Read impl: pulls validated blocks from output channel on demand]
+    | Drains current block, then pulls next block lazily
+    | Only blocks being read + small lookahead are in memory
 ```
 
-**Speculative parallel:** ALL candidate ranges are decompressed in
-parallel.  Most are valid (~1 false positive per 2^48 bits of data).
-When the validator detects a CRC mismatch, it discards the speculative
-result, merges the bit ranges, and re-decompresses the merged range
-sequentially (rare path, single extra decompression per false positive).
+**Streaming + backpressure:** The bounded channels between stages
+ensure that the Rayon pool only stays a small number of blocks ahead
+of the reader.  When the reader stalls, the output channel fills, the
+validator blocks, the result channel fills, and Rayon workers block on
+send — naturally throttling decompression without explicit coordination.
+
+**Speculative parallel:** All candidate ranges are dispatched for
+parallel decompression.  Most are valid (~1 false positive per 2^48
+bits of data).  When the validator detects a CRC mismatch, it
+accumulates contiguous failures into a group.  Once the next success
+arrives (or EOS is reached), the failure group is merged into a single
+range [first_fail.start, first_success.start) and re-decompressed on
+the validator thread (rare path, sequential, ≤1 extra decompression
+per false positive).
+
+**False-positive resolution algorithm:**
+1. Walk results in block-index order.
+2. On success with valid CRC: emit block, advance.
+3. On failure (decompression error or CRC mismatch): push onto the
+   current failure group.
+4. When a success follows a failure group: merge the group's ranges
+   into [group_first.start_bit, success.start_bit), re-decompress the
+   merged range, emit, then emit the success, advance.
+5. If all remaining ranges fail (through EOS): merge into
+   [group_first.start_bit, eos_bit), re-decompress.  If this still
+   fails, the data is genuinely corrupt — return error.
+
+**Memory budget:** At steady state, memory holds ≤ (result_channel_cap
++ output_channel_cap + 1) decompressed blocks, each ≤ 900 KB.  For
+default settings (~4 output + ~16 result), this is ~18 MB regardless
+of input file size.
 
 ### Compression: Parallel Block Compression
 
@@ -202,14 +239,17 @@ thiserror = "2"              # Error types
 | 1     | Project scaffold, `error.rs`, `crc.rs`, `bits.rs`    | 2h   |
 | 2     | `scanner.rs` -- parallel block boundary scanning      | 3h   |
 | 3     | `decompress/block.rs` -- single-block + CRC validate  | 2h   |
-| 4     | `decompress/pipeline.rs` -- speculative parallel      | 4h   |
+| 4     | `decompress/pipeline.rs` -- streaming speculative     | 5h   |
+|       |   pipeline with bounded channels, reorder buffer,     |      |
+|       |   false-positive merge-and-retry, backpressure        |      |
 | 5     | `decompress/mod.rs` -- `ParBz2Decoder`, Read impl     | 2h   |
+|       |   with lazy block consumption from output channel     |      |
 | 6     | Decompress tests: roundtrip, compat, false-positive   | 3h   |
 | 7     | `compress/block.rs` -- single-block via libbzip2      | 2h   |
 | 8     | `compress/pipeline.rs` -- splitter + Rayon + assemble | 4h   |
 | 9     | `compress/mod.rs` -- `ParBz2Encoder`, Write impl      | 2h   |
 | 10    | Compress tests + full roundtrip suite                 | 2h   |
-|       | **Total**                                             | ~26h |
+|       | **Total**                                             | ~27h |
 
 ---
 
@@ -222,17 +262,22 @@ thiserror = "2"              # Error types
    boundaries.  The bzip2 block CRC covers uncompressed data, so there
    is no way to validate without decompressing first.
 
-3. **Speculative parallel decompression** -- all candidate ranges are
-   decompressed in parallel.  On the rare occasion that a false positive
-   is detected (CRC mismatch), the speculative result is discarded, the
-   bit range is merged with the next candidate, and decompression is
-   retried.  This wastes one extra decompression per false positive
-   (~1 per 2^48 bits = negligible) but keeps the common path fully
-   parallel.
+3. **Streaming speculative decompression** -- all candidate ranges are
+   dispatched for parallel decompression, but bounded channels between
+   stages ensure only a small window of blocks is ever in memory.
+   Backpressure flows naturally from the reader through the validator to
+   the Rayon workers.  On the rare occasion that a false positive is
+   detected (CRC mismatch), contiguous failures are merged into one
+   range and re-decompressed on the validator thread.
 
 4. **Merge + retry** for false positives rather than skip.  This recovers
    the ~900KB of data that would otherwise be lost at the false-positive
    boundary.
+
+5. **Lazy block consumption** -- the Read impl pulls blocks from the
+   output channel on demand.  Only the block currently being drained
+   plus a small lookahead (bounded output channel) are in memory.  This
+   keeps memory usage constant regardless of input file size.
 
 5. **Rayon thread pool** for CPU-bound block decompression/compression.
    Each block is ~900KB of uncompressed data, so the work per task is
