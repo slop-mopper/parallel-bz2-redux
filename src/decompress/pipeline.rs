@@ -359,6 +359,13 @@ impl Validator
 
 		match decompress_block(&self.data, merged_start, merged_end, self.level) {
 			Ok(br) if br.crc_valid => self.emit(ValidatedBlock { index: fg_start, data: br.data, crc: br.stored_crc }),
+			// DEFENSIVE: This branch is unreachable with a correct libbzip2
+			// implementation.  libbzip2 validates the block CRC internally
+			// during decompression — if the CRC doesn't match, it returns
+			// BZ_DATA_ERROR (mapped to Err), never Ok.  Our stored_crc is
+			// read from the same bits that libbzip2 reads, so a successful
+			// decompression guarantees crc_valid == true.  Kept as a safety
+			// net in case of libbzip2 behavioural changes.
 			Ok(br) => self.emit_error(Bz2Error::CrcMismatch {
 				offset: merged_start,
 				stored: br.stored_crc,
@@ -387,6 +394,8 @@ impl Validator
 					crc: br.stored_crc,
 				}));
 			}
+			// DEFENSIVE: Unreachable for the same reason as in
+			// resolve_failure_group — see comment there.
 			Ok(br) => {
 				let _ = self.output_tx.send(Err(Bz2Error::CrcMismatch {
 					offset: merged_start,
@@ -835,5 +844,157 @@ mod tests
 		let first = pipeline.recv();
 		assert!(first.is_some());
 		drop(pipeline); // Should not hang or panic.
+	}
+
+	// ── Coverage: corrupt data + false positive → emit_error ────────
+
+	/// Helper: corrupt payload bytes inside a compressed block, leaving
+	/// the block magic, EOS magic, and their surrounding structure intact
+	/// so the scanner still finds all markers.
+	fn corrupt_block_payload(compressed: &mut [u8], block_bit: u64)
+	{
+		// Block layout: 48-bit magic + 32-bit CRC + 1-bit randomised + 24-bit orig_ptr + ...
+		// Payload starts around bit_offset + 105.  Corrupt 10 bytes well into
+		// the Huffman/RLE data.
+		let payload_byte = ((block_bit + 160) / 8) as usize;
+		for i in 0..10 {
+			if payload_byte + i < compressed.len() {
+				compressed[payload_byte + i] ^= 0xFF;
+			}
+		}
+	}
+
+	/// Corrupt data + fake candidate mid-block → resolve_failure_group
+	/// gets Err from the merged re-decompress → emit_error (path A/C).
+	#[test]
+	fn test_pipeline_corrupt_data_with_false_positive_mid_block()
+	{
+		let line = "Corrupt data merge-and-retry error test. ";
+		let original: Vec<u8> = line.as_bytes().iter().copied().cycle().take(4096).collect();
+		let mut compressed = compress(&original, 9);
+		let data_arc: Arc<[u8]> = Arc::from(compressed.as_slice());
+
+		let scanner = Scanner::new();
+		let mut candidates = scanner.scan(&data_arc);
+
+		let block = candidates.iter().find(|c| c.marker_type == MarkerType::Block).unwrap();
+		let eos = candidates.iter().find(|c| c.marker_type == MarkerType::Eos).unwrap();
+		let block_bit = block.bit_offset;
+		let eos_bit = eos.bit_offset;
+
+		// Corrupt the block payload in the mutable copy.
+		corrupt_block_payload(&mut compressed, block_bit);
+
+		// Inject a fake Block candidate mid-block.
+		let fake_bit = ((block_bit + eos_bit) / 2 / 8) * 8;
+		candidates.push(Candidate { bit_offset: fake_bit, marker_type: MarkerType::Block });
+		candidates.sort();
+
+		// Use the corrupted data.
+		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default()).unwrap();
+
+		// Should receive an error (merged range also fails to decompress).
+		let mut got_error = false;
+		while let Some(result) = pipeline.recv() {
+			if result.is_err() {
+				got_error = true;
+				break;
+			}
+		}
+		assert!(
+			got_error,
+			"pipeline should propagate error for corrupt data with false positive"
+		);
+	}
+
+	/// Corrupt data + fake candidate near EOS → resolve_trailing_failures
+	/// gets Err → sends error to output channel (path B/C).
+	#[test]
+	fn test_pipeline_corrupt_data_with_trailing_false_positive()
+	{
+		let original = b"Trailing failure with corrupt data for emit_error coverage.";
+		let mut compressed = compress(original, 9);
+		let data_arc: Arc<[u8]> = Arc::from(compressed.as_slice());
+
+		let scanner = Scanner::new();
+		let mut candidates = scanner.scan(&data_arc);
+
+		let block = candidates.iter().find(|c| c.marker_type == MarkerType::Block).unwrap();
+		let eos = candidates.iter().find(|c| c.marker_type == MarkerType::Eos).unwrap();
+		let block_bit = block.bit_offset;
+		let eos_bit = eos.bit_offset;
+
+		// Corrupt payload.
+		corrupt_block_payload(&mut compressed, block_bit);
+
+		// Inject fake trailing candidate near EOS (but before it).
+		let fake_bit = ((eos_bit - 16) / 8) * 8;
+		candidates.push(Candidate { bit_offset: fake_bit, marker_type: MarkerType::Block });
+		candidates.sort();
+
+		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let pipeline = DecompressPipeline::start(data, candidates, 9, PipelineConfig::default()).unwrap();
+
+		let mut got_error = false;
+		while let Some(result) = pipeline.recv() {
+			if result.is_err() {
+				got_error = true;
+				break;
+			}
+		}
+		assert!(
+			got_error,
+			"pipeline should propagate error for corrupt trailing failure"
+		);
+	}
+
+	/// Multi-block: corrupt first block + inject fake between blocks 1 and 2.
+	/// Tests resolve_failure_group error path when a successful block follows.
+	#[test]
+	fn test_pipeline_corrupt_first_block_with_false_positive()
+	{
+		// Generate multi-block data.
+		let mut rng: u64 = 0xBADD_A7A1;
+		let original: Vec<u8> = (0..250_000)
+			.map(|_| {
+				rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+				(rng >> 33) as u8
+			})
+			.collect();
+
+		let mut compressed = compress(&original, 1);
+		let data_arc: Arc<[u8]> = Arc::from(compressed.as_slice());
+
+		let scanner = Scanner::new();
+		let mut candidates = scanner.scan(&data_arc);
+
+		let blocks: Vec<_> = candidates.iter().filter(|c| c.marker_type == MarkerType::Block).copied().collect();
+		assert!(blocks.len() >= 2, "need ≥2 blocks, got {}", blocks.len());
+
+		// Corrupt only the first block's payload.
+		corrupt_block_payload(&mut compressed, blocks[0].bit_offset);
+
+		// Inject fake candidate between first and second real blocks.
+		let fake_bit = ((blocks[0].bit_offset + blocks[1].bit_offset) / 2 / 8) * 8;
+		candidates.push(Candidate { bit_offset: fake_bit, marker_type: MarkerType::Block });
+		candidates.sort();
+
+		let data: Arc<[u8]> = Arc::from(compressed.as_slice());
+		let pipeline = DecompressPipeline::start(data, candidates, 1, PipelineConfig::default()).unwrap();
+
+		// The first block's failure group (block 0 + fake) will fail even after
+		// merge.  The pipeline should emit an error for it.
+		let mut got_error = false;
+		while let Some(result) = pipeline.recv() {
+			if result.is_err() {
+				got_error = true;
+				break;
+			}
+		}
+		assert!(
+			got_error,
+			"pipeline should emit error for corrupt block even after merge attempt"
+		);
 	}
 }
