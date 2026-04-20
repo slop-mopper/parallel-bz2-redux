@@ -847,4 +847,39 @@ mod tests
 		assert!(compressed.len() > partial_len, "finish() should write EOS + remaining");
 		assert_eq!(reference_decompress(compressed), original);
 	}
+
+	// ── ParBz2Encoder::builder() ────────────────────────────────────
+
+	#[test]
+	fn test_encoder_builder_method()
+	{
+		// Exercise the ParBz2Encoder::builder() associated function.
+		let original = b"Test via ParBz2Encoder::builder()";
+		let mut output = Vec::new();
+		{
+			let mut enc = ParBz2Encoder::<Vec<u8>>::builder().level(5).build(&mut output).unwrap();
+			enc.write_all(original).unwrap();
+			enc.finish().unwrap();
+		}
+		assert_eq!(output[3], b'5');
+		assert_eq!(reference_decompress(&output), original);
+	}
+
+	// ── try_finish() idempotency ────────────────────────────────────
+
+	#[test]
+	fn test_encoder_try_finish_twice()
+	{
+		// Calling try_finish() twice should be a no-op the second time.
+		let original = b"Double try_finish test.";
+		let mut output = Vec::new();
+		{
+			let mut enc = ParBz2Encoder::new(&mut output, 9).unwrap();
+			enc.write_all(original).unwrap();
+			enc.try_finish().unwrap();
+			// Second call hits the `if self.done { return Ok(()) }` path.
+			enc.try_finish().unwrap();
+		}
+		assert_eq!(reference_decompress(&output), original);
+	}
 }
