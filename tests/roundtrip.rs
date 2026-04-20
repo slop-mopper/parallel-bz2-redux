@@ -311,3 +311,68 @@ fn open_from_file()
 	let _ = std::fs::remove_file(&path);
 	let _ = std::fs::remove_dir(&dir);
 }
+
+// ── Multi-stream roundtrip ─────────────────────────────────────────
+
+/// Two concatenated streams at different levels — full roundtrip.
+#[test]
+fn roundtrip_multi_stream_two_levels()
+{
+	let a = lcg_bytes(0xAA, 8192);
+	let b = lcg_bytes(0xBB, 16384);
+
+	let mut compressed = bz2_compress(&a, 3);
+	compressed.extend(bz2_compress(&b, 7));
+
+	let mut expected = a;
+	expected.extend(&b);
+
+	let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+	let mut out = Vec::new();
+	decoder.read_to_end(&mut out).unwrap();
+	assert_eq!(out, expected);
+}
+
+/// Three streams, each with enough data to produce multiple blocks.
+#[test]
+fn roundtrip_multi_stream_multi_block()
+{
+	let parts: Vec<Vec<u8>> = (0..3u64).map(|i| lcg_bytes(i * 111 + 1, 250_000)).collect();
+
+	let mut compressed = Vec::new();
+	let mut expected = Vec::new();
+	for (i, part) in parts.iter().enumerate() {
+		compressed.extend(bz2_compress(part, (i as u32 % 9) + 1));
+		expected.extend_from_slice(part);
+	}
+
+	let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+	let mut out = Vec::new();
+	decoder.read_to_end(&mut out).unwrap();
+	assert_eq!(out.len(), expected.len());
+	assert_eq!(out, expected);
+}
+
+/// Multi-stream matches independent reference decompression of each stream.
+#[test]
+fn multi_stream_matches_reference()
+{
+	let chunks: Vec<(Vec<u8>, u32)> = vec![
+		(lcg_bytes(42, 4096), 5),
+		(lcg_bytes(99, 8192), 2),
+		(lcg_bytes(7, 2048), 9),
+	];
+
+	let mut compressed = Vec::new();
+	let mut expected = Vec::new();
+	for (data, level) in &chunks {
+		let c = bz2_compress(data, *level);
+		expected.extend(bz2_reference_decompress(&c));
+		compressed.extend(c);
+	}
+
+	let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+	let mut out = Vec::new();
+	decoder.read_to_end(&mut out).unwrap();
+	assert_eq!(out, expected);
+}

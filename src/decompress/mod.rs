@@ -27,6 +27,7 @@
 pub mod block;
 pub mod pipeline;
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::path::Path;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use crate::bits::read_u32_at_bit;
 use crate::crc::combine_stream_crc;
 use crate::error::Bz2Error;
 use crate::error::Result;
+use crate::scanner::Candidate;
 use crate::scanner::MarkerType;
 use crate::scanner::Scanner;
 
@@ -61,6 +63,62 @@ fn parse_header(data: &[u8]) -> Result<u8>
 	Ok(level_byte - b'0')
 }
 
+// ── Multi-stream partitioning ──────────────────────────────────────
+
+/// Information about a single bzip2 stream within potentially concatenated
+/// multi-stream data.
+struct StreamInfo
+{
+	/// Compression level (1–9) from this stream's header.
+	level: u8,
+	/// Scanner candidates belonging to this stream (blocks + EOS).
+	candidates: Vec<Candidate>,
+	/// Stream CRC stored in the EOS marker.
+	stored_stream_crc: u32,
+}
+
+/// Partition sorted scanner candidates into per-stream groups.
+///
+/// Walks candidates in bit-offset order, splitting at each EOS marker.
+/// For each stream, parses the `BZh` header to get the compression level
+/// and reads the stored stream CRC from the EOS marker.
+fn find_streams(data: &[u8], candidates: &[Candidate]) -> Result<Vec<StreamInfo>>
+{
+	let mut streams = Vec::new();
+	let mut stream_candidates: Vec<Candidate> = Vec::new();
+	let mut header_byte_offset: usize = 0;
+
+	for &c in candidates {
+		stream_candidates.push(c);
+
+		if c.marker_type == MarkerType::Eos {
+			let level = parse_header(data.get(header_byte_offset..).unwrap_or(&[]))?;
+			let eos_bit = c.bit_offset;
+			let stored_stream_crc = read_u32_at_bit(data, eos_bit + 48);
+
+			streams.push(StreamInfo {
+				level,
+				candidates: std::mem::take(&mut stream_candidates),
+				stored_stream_crc,
+			});
+
+			// Next stream header starts at the next byte boundary after
+			// the EOS marker (48-bit magic + 32-bit CRC + 0–7 padding).
+			header_byte_offset = ((eos_bit + 80 + 7) / 8) as usize;
+		}
+	}
+
+	if !stream_candidates.is_empty() {
+		return Err(Bz2Error::InvalidFormat("trailing blocks without EOS marker".into()));
+	}
+
+	if streams.is_empty() {
+		return Err(Bz2Error::InvalidFormat("no bzip2 streams found".into()));
+	}
+
+	Ok(streams)
+}
+
 // ── ParBz2Decoder ──────────────────────────────────────────────────
 
 /// Parallel bzip2 decoder implementing [`Read`].
@@ -69,26 +127,36 @@ fn parse_header(data: &[u8]) -> Result<u8>
 /// in parallel via Rayon and streamed in order through bounded channels —
 /// only a small window of blocks is ever in memory.
 ///
+/// Supports concatenated multi-stream bzip2 files: each stream is
+/// decompressed through its own pipeline, sequentially.
+///
 /// # Stream CRC verification
 ///
-/// By default, the stream CRC is verified after all blocks have been
-/// consumed.  If the CRC does not match, the final `read()` call returns
-/// an I/O error with [`ErrorKind::InvalidData`](std::io::ErrorKind::InvalidData).
+/// By default, each stream's CRC is verified when that stream ends.
+/// If a CRC does not match, the next `read()` call returns an I/O error
+/// with [`ErrorKind::InvalidData`](std::io::ErrorKind::InvalidData).
 /// Disable this via [`ParBz2DecoderBuilder::verify_stream_crc(false)`].
 pub struct ParBz2Decoder
 {
-	pipeline: DecompressPipeline,
+	/// Full compressed data (shared with pipelines via Arc).
+	data: Arc<[u8]>,
+	/// Pipeline configuration (reused for each stream's pipeline).
+	config: PipelineConfig,
+	/// Remaining streams to decompress (front = next).
+	streams: VecDeque<StreamInfo>,
+	/// Active pipeline for the current stream, or `None` between streams.
+	pipeline: Option<DecompressPipeline>,
 	/// Current block's decompressed data.
 	current_block: Vec<u8>,
 	/// Read cursor within `current_block`.
 	cursor: usize,
-	/// Running combined stream CRC (`rol1(combined) ^ block_crc`).
+	/// Running combined stream CRC for the current stream.
 	stream_crc: u32,
-	/// Stream CRC stored in the bzip2 EOS marker.
+	/// Stream CRC stored in the current stream's EOS marker.
 	stored_stream_crc: u32,
-	/// Whether to verify the stream CRC when EOF is reached.
+	/// Whether to verify each stream's CRC when it ends.
 	verify_stream_crc: bool,
-	/// `true` once the pipeline is exhausted and all data has been read.
+	/// `true` once all streams are exhausted and all data has been read.
 	done: bool,
 }
 
@@ -119,22 +187,21 @@ impl ParBz2Decoder
 	/// Internal constructor shared by all entry points.
 	fn build(data: Arc<[u8]>, config: PipelineConfig, verify_stream_crc: bool) -> Result<Self>
 	{
-		let level = parse_header(&data)?;
-
 		let scanner = Scanner::new();
 		let candidates = scanner.scan_parallel(&data);
+		let all_streams = find_streams(&data, &candidates)?;
+		let mut streams = VecDeque::from(all_streams);
 
-		// Read stored stream CRC from the EOS marker (32 bits after the 48-bit magic).
-		let stored_stream_crc = candidates
-			.iter()
-			.find(|c| c.marker_type == MarkerType::Eos)
-			.map(|eos| read_u32_at_bit(&data, eos.bit_offset + 48))
-			.unwrap_or(0); // pair_candidates will catch missing EOS
-
-		let pipeline = DecompressPipeline::start(data, candidates, level, config)?;
+		// Start the first stream's pipeline immediately.
+		let first = streams.pop_front().expect("find_streams guarantees at least one stream");
+		let stored_stream_crc = first.stored_stream_crc;
+		let pipeline = DecompressPipeline::start(Arc::clone(&data), first.candidates, first.level, config.clone())?;
 
 		Ok(Self {
-			pipeline,
+			data,
+			config,
+			streams,
+			pipeline: Some(pipeline),
 			current_block: Vec::new(),
 			cursor: 0,
 			stream_crc: 0,
@@ -158,22 +225,60 @@ impl ParBz2Decoder
 
 	/// Pull the next block from the pipeline into `current_block`.
 	///
-	/// Returns `Ok(true)` if a block was received, `Ok(false)` if the
-	/// pipeline is exhausted, or `Err` on decompression failure.
+	/// Handles stream transitions: when the current stream's pipeline is
+	/// exhausted, verifies its CRC and starts the next stream's pipeline.
+	///
+	/// Returns `Ok(true)` if a block was received, `Ok(false)` if all
+	/// streams are exhausted, or `Err` on decompression/CRC failure.
 	fn pull_next_block(&mut self) -> std::io::Result<bool>
 	{
-		match self.pipeline.recv() {
-			Some(Ok(block)) => {
-				self.stream_crc = combine_stream_crc(self.stream_crc, block.crc);
-				self.current_block = block.data;
-				self.cursor = 0;
-				Ok(true)
+		loop {
+			if let Some(ref mut pipeline) = self.pipeline {
+				match pipeline.recv() {
+					Some(Ok(block)) => {
+						self.stream_crc = combine_stream_crc(self.stream_crc, block.crc);
+						self.current_block = block.data;
+						self.cursor = 0;
+						return Ok(true);
+					}
+					Some(Err(e)) => {
+						self.done = true;
+						return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
+					}
+					None => {
+						// Current stream exhausted.  Verify its CRC.
+						if self.verify_stream_crc && self.stream_crc != self.stored_stream_crc {
+							self.done = true;
+							return Err(std::io::Error::new(
+								std::io::ErrorKind::InvalidData,
+								format!(
+									"stream CRC mismatch: stored={:#010x} computed={:#010x}",
+									self.stored_stream_crc, self.stream_crc
+								),
+							));
+						}
+						self.pipeline = None;
+					}
+				}
 			}
-			Some(Err(e)) => {
-				self.done = true;
-				Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
+
+			// Try to start the next stream's pipeline.
+			if let Some(stream) = self.streams.pop_front() {
+				self.stream_crc = 0;
+				self.stored_stream_crc = stream.stored_stream_crc;
+				let pipeline = DecompressPipeline::start(
+					Arc::clone(&self.data),
+					stream.candidates,
+					stream.level,
+					self.config.clone(),
+				)
+				.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+				self.pipeline = Some(pipeline);
+				continue;
 			}
-			None => Ok(false),
+
+			// No more streams.
+			return Ok(false);
 		}
 	}
 }
@@ -203,19 +308,9 @@ impl Read for ParBz2Decoder
 				return Ok(n);
 			}
 
-			// Current block exhausted — pull the next one.
+			// Current block exhausted — pull the next one (may start next stream).
 			if !self.pull_next_block()? {
-				// Pipeline exhausted.  Verify stream CRC if requested.
 				self.done = true;
-				if self.verify_stream_crc && self.stream_crc != self.stored_stream_crc {
-					return Err(std::io::Error::new(
-						std::io::ErrorKind::InvalidData,
-						format!(
-							"stream CRC mismatch: stored={:#010x} computed={:#010x}",
-							self.stored_stream_crc, self.stream_crc
-						),
-					));
-				}
 				return Ok(0);
 			}
 		}
@@ -602,5 +697,220 @@ mod tests
 			ParBz2Decoder::from_bytes(data),
 			Err(Bz2Error::InvalidFormat(_))
 		));
+	}
+
+	// ── find_streams ──────────────────────────────────────────────
+
+	#[test]
+	fn test_find_streams_single()
+	{
+		let original = b"Single stream test.";
+		let compressed = compress(original, 9);
+		let scanner = Scanner::new();
+		let candidates = scanner.scan_parallel(&compressed);
+		let streams = find_streams(&compressed, &candidates).unwrap();
+		assert_eq!(streams.len(), 1);
+		assert_eq!(streams[0].level, 9);
+	}
+
+	#[test]
+	fn test_find_streams_multi()
+	{
+		let c1 = compress(b"stream one", 5);
+		let c2 = compress(b"stream two", 3);
+		let mut combined = c1;
+		combined.extend(&c2);
+
+		let scanner = Scanner::new();
+		let candidates = scanner.scan_parallel(&combined);
+		let streams = find_streams(&combined, &candidates).unwrap();
+		assert_eq!(streams.len(), 2);
+		assert_eq!(streams[0].level, 5);
+		assert_eq!(streams[1].level, 3);
+	}
+
+	#[test]
+	fn test_find_streams_no_candidates()
+	{
+		// No candidates at all → error.
+		let data = b"BZh9";
+		let result = find_streams(data, &[]);
+		assert!(matches!(result, Err(Bz2Error::InvalidFormat(_))));
+	}
+
+	// ── ParBz2Decoder: multi-stream ───────────────────────────────
+
+	#[test]
+	fn test_decoder_multi_stream_same_level()
+	{
+		let a = b"First stream content.";
+		let b_data = b"Second stream content.";
+
+		let mut compressed = compress(a, 9);
+		compressed.extend(compress(b_data, 9));
+
+		let mut expected = Vec::new();
+		expected.extend_from_slice(a);
+		expected.extend_from_slice(b_data);
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+
+		assert_eq!(output, expected);
+	}
+
+	#[test]
+	fn test_decoder_multi_stream_different_levels()
+	{
+		let a = b"Level three data here.";
+		let b_data = b"Level seven data here.";
+
+		let mut compressed = compress(a, 3);
+		compressed.extend(compress(b_data, 7));
+
+		let mut expected = Vec::new();
+		expected.extend_from_slice(a);
+		expected.extend_from_slice(b_data);
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+
+		assert_eq!(output, expected);
+	}
+
+	#[test]
+	fn test_decoder_three_streams()
+	{
+		let parts: [&[u8]; 3] = [b"one", b"two", b"three"];
+
+		let mut compressed = Vec::new();
+		let mut expected = Vec::new();
+		for (i, part) in parts.iter().enumerate() {
+			compressed.extend(compress(part, (i as u32 % 9) + 1));
+			expected.extend_from_slice(part);
+		}
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+
+		assert_eq!(output, expected);
+	}
+
+	#[test]
+	fn test_decoder_multi_stream_multi_block()
+	{
+		// Two streams, each with multiple blocks (level 1, ~250KB random).
+		let mut rng: u64 = 0xDEAD_BEEF;
+		let make_random = |rng: &mut u64, len: usize| -> Vec<u8> {
+			(0..len)
+				.map(|_| {
+					*rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+					(*rng >> 33) as u8
+				})
+				.collect()
+		};
+
+		let a = make_random(&mut rng, 250_000);
+		let b_data = make_random(&mut rng, 250_000);
+
+		let mut compressed = compress(&a, 1);
+		compressed.extend(compress(&b_data, 1));
+
+		let mut expected = Vec::new();
+		expected.extend_from_slice(&a);
+		expected.extend_from_slice(&b_data);
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+
+		assert_eq!(output.len(), expected.len());
+		assert_eq!(output, expected);
+	}
+
+	#[test]
+	fn test_decoder_multi_stream_empty_first()
+	{
+		// Empty stream followed by a non-empty stream.
+		let mut compressed = compress(b"", 9);
+		compressed.extend(compress(b"after empty", 5));
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+
+		assert_eq!(output, b"after empty");
+	}
+
+	#[test]
+	fn test_decoder_multi_stream_empty_last()
+	{
+		// Non-empty stream followed by an empty stream.
+		let mut compressed = compress(b"before empty", 5);
+		compressed.extend(compress(b"", 9));
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+
+		assert_eq!(output, b"before empty");
+	}
+
+	#[test]
+	fn test_decoder_multi_stream_byte_at_a_time()
+	{
+		let mut compressed = compress(b"AAA", 9);
+		compressed.extend(compress(b"BBB", 9));
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		let mut byte = [0u8; 1];
+		loop {
+			match decoder.read(&mut byte) {
+				Ok(0) => break,
+				Ok(1) => output.push(byte[0]),
+				Ok(n) => panic!("read returned {n} for 1-byte buffer"),
+				Err(e) => panic!("unexpected error: {e}"),
+			}
+		}
+
+		assert_eq!(output, b"AAABBB");
+	}
+
+	#[test]
+	fn test_decoder_multi_stream_crc_valid()
+	{
+		let mut compressed = compress(b"CRC stream one.", 9);
+		compressed.extend(compress(b"CRC stream two.", 7));
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		// CRC is verified per-stream inside pull_next_block; if it fails,
+		// read_to_end returns an error.
+		decoder.read_to_end(&mut output).unwrap();
+
+		assert_eq!(output, b"CRC stream one.CRC stream two.");
+	}
+
+	#[test]
+	fn test_decoder_multi_stream_matches_reference()
+	{
+		let mut compressed = compress(b"ref check A", 4);
+		compressed.extend(compress(b"ref check B", 6));
+
+		// Reference: decompress each stream independently and concatenate.
+		let ref_a = reference_decompress(&compress(b"ref check A", 4));
+		let ref_b = reference_decompress(&compress(b"ref check B", 6));
+		let mut expected = ref_a;
+		expected.extend(ref_b);
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed)).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+
+		assert_eq!(output, expected);
 	}
 }
