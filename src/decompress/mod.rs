@@ -135,7 +135,7 @@ fn find_streams(data: &[u8], candidates: &[Candidate]) -> Result<Vec<StreamInfo>
 /// By default, each stream's CRC is verified when that stream ends.
 /// If a CRC does not match, the next `read()` call returns an I/O error
 /// with [`ErrorKind::InvalidData`](std::io::ErrorKind::InvalidData).
-/// Disable this via [`ParBz2DecoderBuilder::verify_stream_crc(false)`].
+/// Disable this via [`ParBz2DecoderBuilder::verify_stream_crc`].
 pub struct ParBz2Decoder
 {
 	/// Full compressed data (shared with pipelines via Arc).

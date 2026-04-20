@@ -44,7 +44,7 @@ const EOS_MAGIC: u64 = 0x177245385090;
 
 /// Split input data into block-sized chunks for compression.
 ///
-/// Each chunk is at most [`max_block_bytes(level)`] bytes, which is the
+/// Each chunk is at most [`super::block::max_block_bytes`] bytes, which is the
 /// effective maximum that libbzip2 can fit into a single block at the
 /// given compression level.
 ///

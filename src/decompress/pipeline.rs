@@ -157,8 +157,8 @@ impl DecompressPipeline
 	/// Start the pipeline.
 	///
 	/// `data` is the full compressed file.  `candidates` must be sorted
-	/// by bit offset (as returned by [`Scanner::scan`] /
-	/// [`Scanner::scan_parallel`]).  `level` is the bzip2 compression
+	/// by bit offset (as returned by [`crate::scanner::Scanner::scan`] /
+	/// [`crate::scanner::Scanner::scan_parallel`]).  `level` is the bzip2 compression
 	/// level from the stream header (`1`–`9`).
 	pub fn start(data: Arc<[u8]>, candidates: Vec<Candidate>, level: u8, config: PipelineConfig) -> Result<Self>
 	{

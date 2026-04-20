@@ -260,7 +260,7 @@ impl BitWriter
 	/// Three internal paths, fastest first:
 	/// 1. Both source and dest byte-aligned → memcpy + tail.
 	/// 2. Dest byte-aligned, source not → shifted read, direct push.
-	/// 3. General → byte-at-a-time through [`write_bits`].
+	/// 3. General → byte-at-a-time through [`Self::write_bits`].
 	pub fn copy_bits_from(&mut self, src: &[u8], src_start_bit: u64, num_bits: u64)
 	{
 		if num_bits == 0 {
@@ -343,8 +343,8 @@ impl BitWriter
 
 	/// Flush all complete bytes to a writer, keeping any trailing partial byte.
 	///
-	/// This enables incremental output: append bits via [`write_bits`],
-	/// [`write_bytes`], or [`copy_bits_from`], then periodically flush
+	/// This enables incremental output: append bits via [`Self::write_bits`],
+	/// [`Self::write_bytes`], or [`Self::copy_bits_from`], then periodically flush
 	/// complete bytes to the underlying writer.  The partial trailing
 	/// byte (0–7 bits) remains in the buffer for the next append.
 	///
