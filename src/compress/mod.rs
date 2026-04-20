@@ -307,6 +307,7 @@ impl<W: Write> Drop for ParBz2Encoder<W>
 /// encoder.write_all(b"test").unwrap();
 /// encoder.finish().unwrap();
 /// ```
+#[derive(Debug, Clone)]
 pub struct ParBz2EncoderBuilder
 {
 	level: u8,

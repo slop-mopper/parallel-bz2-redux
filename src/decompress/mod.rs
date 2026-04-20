@@ -322,6 +322,7 @@ impl Read for ParBz2Decoder
 /// Builder for configuring a [`ParBz2Decoder`].
 ///
 /// Obtain via [`ParBz2Decoder::builder()`].
+#[derive(Debug, Clone)]
 pub struct ParBz2DecoderBuilder
 {
 	config: PipelineConfig,

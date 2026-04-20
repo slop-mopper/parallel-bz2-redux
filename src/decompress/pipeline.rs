@@ -58,7 +58,7 @@ pub struct BlockRange
 }
 
 /// Configuration for the decompression pipeline.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineConfig
 {
 	/// Capacity of the result channel (workers → validator).
@@ -79,7 +79,7 @@ impl Default for PipelineConfig
 }
 
 /// A validated, decompressed block ready for consumption.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ValidatedBlock
 {
 	/// Block index in the original sequence (0-based).

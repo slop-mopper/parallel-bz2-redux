@@ -68,6 +68,7 @@ impl Ord for Candidate
 ///
 /// Holds a compiled Aho-Corasick automaton with 16 patterns: 8 bit-shifted
 /// variants of the block magic and 8 of the EOS magic.
+#[derive(Debug)]
 pub struct Scanner
 {
 	/// Compiled multi-pattern automaton.

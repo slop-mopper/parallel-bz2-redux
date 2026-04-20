@@ -134,6 +134,7 @@ fn read_byte_at_bit(src: &[u8], bit_pos: u64) -> u8
 /// assert_eq!(w.bit_len(), 112);
 /// assert_eq!(&w.into_bytes()[..4], b"BZh9");
 /// ```
+#[derive(Debug)]
 pub struct BitWriter
 {
 	buf: Vec<u8>,

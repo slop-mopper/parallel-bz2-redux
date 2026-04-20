@@ -20,7 +20,7 @@ use crate::error::Result;
 const EOS_MAGIC: u64 = 0x177245385090;
 
 /// Result of decompressing a single bzip2 block.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BlockResult
 {
 	/// Decompressed block data.

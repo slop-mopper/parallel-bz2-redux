@@ -52,7 +52,7 @@ pub fn max_block_bytes(level: u8) -> usize
 }
 
 /// Result of compressing a single block of data.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CompressedBlock
 {
 	/// Raw block bits starting with the 48-bit block magic (`0x314159265359`).
