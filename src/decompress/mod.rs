@@ -28,16 +28,20 @@ pub(crate) mod block;
 pub(crate) mod pipeline;
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::io::Read;
 use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use memmap2::Mmap;
 use rayon::ThreadPool;
 
 use self::pipeline::DecompressPipeline;
 pub use self::pipeline::PipelineConfig;
+use self::pipeline::pair_candidates;
 use crate::bits::read_u32_at_bit;
 use crate::crc::combine_stream_crc;
 use crate::error::Bz2Error;
@@ -170,6 +174,218 @@ fn find_streams(data: &[u8], candidates: &[Candidate]) -> Result<Vec<StreamInfo>
 	Ok(streams)
 }
 
+// ── DecoderStats ───────────────────────────────────────────────────
+
+/// Live statistics for a [`ParBz2Decoder`].
+///
+/// An `Arc<DecoderStats>` is created when the decoder is constructed and
+/// shared with the pipeline's validator thread.  Immutable totals are set
+/// once at construction; mutable counters use [`AtomicU64`] and are
+/// updated with [`Relaxed`](Ordering::Relaxed) ordering — perfectly fine
+/// for progress reporting but not suitable as a synchronisation barrier.
+///
+/// Use [`snapshot()`](Self::snapshot) for a consistent point-in-time view
+/// of all counters.
+pub struct DecoderStats
+{
+	/// Total bytes of compressed input data.
+	compressed_bytes_total: u64,
+	/// Total number of bzip2 blocks across all streams.
+	blocks_total: u64,
+	/// Total number of bzip2 streams.
+	streams_total: u64,
+	/// Cumulative decompressed output bytes emitted so far.
+	decompressed_bytes: AtomicU64,
+	/// Number of blocks successfully decompressed and consumed.
+	blocks_completed: AtomicU64,
+	/// Number of streams fully consumed.
+	streams_completed: AtomicU64,
+	/// Bit offset of the last validated block's end (updated by the
+	/// validator thread).
+	compressed_bits_consumed: AtomicU64,
+	/// Wall-clock time when the decoder was created.
+	start_time: Instant,
+}
+
+impl DecoderStats
+{
+	/// Create a new `DecoderStats` with the given totals and zeroed
+	/// counters.  Intended for internal construction.
+	pub(crate) fn new(
+		compressed_bytes_total: u64,
+		blocks_total: u64,
+		streams_total: u64,
+	) -> Self
+	{
+		Self {
+			compressed_bytes_total,
+			blocks_total,
+			streams_total,
+			decompressed_bytes: AtomicU64::new(0),
+			blocks_completed: AtomicU64::new(0),
+			streams_completed: AtomicU64::new(0),
+			compressed_bits_consumed: AtomicU64::new(0),
+			start_time: Instant::now(),
+		}
+	}
+
+	/// Total bytes of compressed input data.
+	pub fn compressed_bytes_total(&self) -> u64
+	{
+		self.compressed_bytes_total
+	}
+
+	/// Total number of bzip2 blocks across all streams.
+	pub fn blocks_total(&self) -> u64
+	{
+		self.blocks_total
+	}
+
+	/// Total number of bzip2 streams.
+	pub fn streams_total(&self) -> u64
+	{
+		self.streams_total
+	}
+
+	/// Cumulative decompressed output bytes emitted so far.
+	pub fn decompressed_bytes(&self) -> u64
+	{
+		self.decompressed_bytes.load(Ordering::Relaxed)
+	}
+
+	/// Number of blocks successfully decompressed and consumed.
+	pub fn blocks_completed(&self) -> u64
+	{
+		self.blocks_completed.load(Ordering::Relaxed)
+	}
+
+	/// Number of streams fully consumed.
+	pub fn streams_completed(&self) -> u64
+	{
+		self.streams_completed.load(Ordering::Relaxed)
+	}
+
+	/// Bit offset just past the last validated block emitted by the
+	/// pipeline.  Useful for estimating progress through the compressed
+	/// data.
+	pub fn compressed_bits_consumed(&self) -> u64
+	{
+		self.compressed_bits_consumed.load(Ordering::Relaxed)
+	}
+
+	/// Wall-clock time elapsed since the decoder was created.
+	pub fn elapsed(&self) -> Duration
+	{
+		self.start_time.elapsed()
+	}
+
+	/// Decompression throughput in bytes per second, measured as
+	/// decompressed output bytes divided by elapsed wall-clock time.
+	///
+	/// Returns `0.0` if no time has elapsed.
+	pub fn decompression_rate(&self) -> f64
+	{
+		let elapsed = self.elapsed().as_secs_f64();
+		if elapsed == 0.0 {
+			return 0.0;
+		}
+		self.decompressed_bytes() as f64 / elapsed
+	}
+
+	/// Fraction of blocks completed (`0.0..=1.0`).
+	///
+	/// Returns `0.0` if `blocks_total` is zero.
+	pub fn progress(&self) -> f64
+	{
+		if self.blocks_total == 0 {
+			return 0.0;
+		}
+		self.blocks_completed() as f64 / self.blocks_total as f64
+	}
+
+	/// Create a frozen point-in-time snapshot of all counters.
+	pub fn snapshot(&self) -> DecoderStatsSnapshot
+	{
+		DecoderStatsSnapshot {
+			compressed_bytes_total: self.compressed_bytes_total,
+			blocks_total: self.blocks_total,
+			streams_total: self.streams_total,
+			decompressed_bytes: self.decompressed_bytes(),
+			blocks_completed: self.blocks_completed(),
+			streams_completed: self.streams_completed(),
+			compressed_bits_consumed: self.compressed_bits_consumed(),
+			elapsed: self.elapsed(),
+		}
+	}
+}
+
+impl fmt::Debug for DecoderStats
+{
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+	{
+		f.debug_struct("DecoderStats")
+			.field("compressed_bytes_total", &self.compressed_bytes_total)
+			.field("blocks_total", &self.blocks_total)
+			.field("streams_total", &self.streams_total)
+			.field("decompressed_bytes", &self.decompressed_bytes())
+			.field("blocks_completed", &self.blocks_completed())
+			.field("streams_completed", &self.streams_completed())
+			.field("compressed_bits_consumed", &self.compressed_bits_consumed())
+			.field("elapsed", &self.elapsed())
+			.finish()
+	}
+}
+
+/// Frozen point-in-time snapshot of decoder statistics.
+///
+/// Obtained via [`DecoderStats::snapshot()`].  All fields are plain
+/// values — no atomics — so the snapshot is cheap to copy and pass
+/// around.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DecoderStatsSnapshot
+{
+	/// Total bytes of compressed input data.
+	pub compressed_bytes_total: u64,
+	/// Total number of bzip2 blocks across all streams.
+	pub blocks_total: u64,
+	/// Total number of bzip2 streams.
+	pub streams_total: u64,
+	/// Cumulative decompressed output bytes emitted so far.
+	pub decompressed_bytes: u64,
+	/// Number of blocks successfully decompressed and consumed.
+	pub blocks_completed: u64,
+	/// Number of streams fully consumed.
+	pub streams_completed: u64,
+	/// Bit offset just past the last validated block.
+	pub compressed_bits_consumed: u64,
+	/// Wall-clock time elapsed since the decoder was created.
+	pub elapsed: Duration,
+}
+
+impl DecoderStatsSnapshot
+{
+	/// Decompression throughput in bytes per second.
+	///
+	/// Returns `0.0` if no time has elapsed.
+	pub fn decompression_rate(&self) -> f64
+	{
+		let secs = self.elapsed.as_secs_f64();
+		if secs == 0.0 {
+			return 0.0;
+		}
+		self.decompressed_bytes as f64 / secs
+	}
+
+	/// Fraction of blocks completed (`0.0..=1.0`).
+	pub fn progress(&self) -> f64
+	{
+		if self.blocks_total == 0 {
+			return 0.0;
+		}
+		self.blocks_completed as f64 / self.blocks_total as f64
+	}
+}
+
 // ── ParBz2Decoder ──────────────────────────────────────────────────
 
 /// Parallel bzip2 decoder implementing [`Read`].
@@ -211,6 +427,11 @@ pub struct ParBz2Decoder
 	verify_stream_crc: bool,
 	/// `true` once all streams are exhausted and all data has been read.
 	done: bool,
+	/// Live statistics shared with the pipeline.
+	stats: Arc<DecoderStats>,
+	/// Optional progress callback, invoked on the reader thread after
+	/// each block is consumed.
+	on_progress: Option<Arc<dyn Fn(&DecoderStats) + Send + Sync>>,
 }
 
 impl ParBz2Decoder
@@ -223,13 +444,13 @@ impl ParBz2Decoder
 	pub fn open<P: AsRef<Path>>(path: P) -> Result<Self>
 	{
 		let data = open_data_source(path.as_ref())?;
-		Self::build(data, PipelineConfig::default(), true, None)
+		Self::build(data, PipelineConfig::default(), true, None, None)
 	}
 
 	/// Create a decoder from in-memory compressed data.
 	pub fn from_bytes(data: Arc<[u8]>) -> Result<Self>
 	{
-		Self::build(DataSource::Owned(data), PipelineConfig::default(), true, None)
+		Self::build(DataSource::Owned(data), PipelineConfig::default(), true, None, None)
 	}
 
 	/// Returns a builder for configuring decompression options.
@@ -244,6 +465,7 @@ impl ParBz2Decoder
 		config: PipelineConfig,
 		verify_stream_crc: bool,
 		pool: Option<Arc<ThreadPool>>,
+		on_progress: Option<Arc<dyn Fn(&DecoderStats) + Send + Sync>>,
 	) -> Result<Self>
 	{
 		let scanner = Scanner::new();
@@ -254,15 +476,32 @@ impl ParBz2Decoder
 		let all_streams = find_streams(&data, &candidates)?;
 		let mut streams = VecDeque::from(all_streams);
 
+		// Count total blocks across all streams for stats.
+		let mut blocks_total: u64 = 0;
+		let streams_total = streams.len() as u64;
+		// We only need the block count; pair_candidates is cheap (just iterates candidates).
+		for stream in streams.iter() {
+			let (ranges, _) = pair_candidates(&stream.candidates)?;
+			blocks_total += ranges.len() as u64;
+		}
+
 		// Start the first stream's pipeline immediately.
 		let first = streams.pop_front().expect("find_streams guarantees at least one stream");
 		let stored_stream_crc = first.stored_stream_crc;
+
+		let stats = Arc::new(DecoderStats::new(
+			data.len() as u64,
+			blocks_total,
+			streams_total,
+		));
+
 		let pipeline = DecompressPipeline::start(
 			data.clone(),
 			first.candidates,
 			first.level,
 			config.clone(),
 			pool.clone(),
+			Arc::clone(&stats),
 		)?;
 
 		Ok(Self {
@@ -277,6 +516,8 @@ impl ParBz2Decoder
 			stored_stream_crc,
 			verify_stream_crc,
 			done: false,
+			stats,
+			on_progress,
 		})
 	}
 
@@ -290,6 +531,16 @@ impl ParBz2Decoder
 	pub fn stored_stream_crc(&self) -> u32
 	{
 		self.stored_stream_crc
+	}
+
+	/// Returns a reference to the shared statistics.
+	///
+	/// The returned `Arc` can be cloned and handed to another thread
+	/// (e.g. a progress-bar thread) that polls the counters while
+	/// decompression is in progress.
+	pub fn stats(&self) -> &Arc<DecoderStats>
+	{
+		&self.stats
 	}
 
 	/// Pull the next block from the pipeline into `current_block`.
@@ -306,8 +557,15 @@ impl ParBz2Decoder
 				match pipeline.recv() {
 					Some(Ok(block)) => {
 						self.stream_crc = combine_stream_crc(self.stream_crc, block.crc);
+						self.stats
+							.decompressed_bytes
+							.fetch_add(block.data.len() as u64, Ordering::Relaxed);
+						self.stats.blocks_completed.fetch_add(1, Ordering::Relaxed);
 						self.current_block = block.data;
 						self.cursor = 0;
+						if let Some(ref cb) = self.on_progress {
+							cb(&self.stats);
+						}
 						return Ok(true);
 					}
 					Some(Err(e)) => {
@@ -326,6 +584,7 @@ impl ParBz2Decoder
 								),
 							));
 						}
+						self.stats.streams_completed.fetch_add(1, Ordering::Relaxed);
 						self.pipeline = None;
 					}
 				}
@@ -341,6 +600,7 @@ impl ParBz2Decoder
 					stream.level,
 					self.config.clone(),
 					self.pool.clone(),
+					Arc::clone(&self.stats),
 				)
 				.map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
 				self.pipeline = Some(pipeline);
@@ -392,19 +652,45 @@ impl Read for ParBz2Decoder
 /// Builder for configuring a [`ParBz2Decoder`].
 ///
 /// Obtain via [`ParBz2Decoder::builder()`].
-#[derive(Debug, Clone)]
 pub struct ParBz2DecoderBuilder
 {
 	config: Option<PipelineConfig>,
 	pool: Option<Arc<ThreadPool>>,
 	verify_stream_crc: bool,
+	on_progress: Option<Arc<dyn Fn(&DecoderStats) + Send + Sync>>,
+}
+
+impl fmt::Debug for ParBz2DecoderBuilder
+{
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+	{
+		f.debug_struct("ParBz2DecoderBuilder")
+			.field("config", &self.config)
+			.field("pool", &self.pool)
+			.field("verify_stream_crc", &self.verify_stream_crc)
+			.field("on_progress", &self.on_progress.as_ref().map(|_| ".."))
+			.finish()
+	}
+}
+
+impl Clone for ParBz2DecoderBuilder
+{
+	fn clone(&self) -> Self
+	{
+		Self {
+			config: self.config.clone(),
+			pool: self.pool.clone(),
+			verify_stream_crc: self.verify_stream_crc,
+			on_progress: self.on_progress.clone(),
+		}
+	}
 }
 
 impl ParBz2DecoderBuilder
 {
 	fn new() -> Self
 	{
-		Self { config: None, pool: None, verify_stream_crc: true }
+		Self { config: None, pool: None, verify_stream_crc: true, on_progress: None }
 	}
 
 	/// Set the pipeline channel capacities.
@@ -442,6 +728,28 @@ impl ParBz2DecoderBuilder
 		self
 	}
 
+	/// Register a progress callback invoked after each block is consumed.
+	///
+	/// The callback runs on the thread that calls [`Read::read()`] — it
+	/// never runs on a Rayon worker thread, so it cannot stall the
+	/// parallel pipeline.
+	///
+	/// ```no_run
+	/// use parallel_bz2_redux::ParBz2Decoder;
+	///
+	/// let decoder = ParBz2Decoder::builder()
+	///     .on_progress(|stats| {
+	///         eprintln!("progress: {:.1}%", stats.progress() * 100.0);
+	///     })
+	///     .open("file.bz2")
+	///     .unwrap();
+	/// ```
+	pub fn on_progress(mut self, cb: impl Fn(&DecoderStats) + Send + Sync + 'static) -> Self
+	{
+		self.on_progress = Some(Arc::new(cb));
+		self
+	}
+
 	/// Resolve the pipeline config: explicit if set, otherwise sized for
 	/// the custom pool (if any) or the global pool.
 	fn resolve_config(&self) -> PipelineConfig
@@ -460,14 +768,14 @@ impl ParBz2DecoderBuilder
 	{
 		let data = open_data_source(path.as_ref())?;
 		let config = self.resolve_config();
-		ParBz2Decoder::build(data, config, self.verify_stream_crc, self.pool)
+		ParBz2Decoder::build(data, config, self.verify_stream_crc, self.pool, self.on_progress)
 	}
 
 	/// Build a decoder from in-memory compressed data.
 	pub fn from_bytes(self, data: Arc<[u8]>) -> Result<ParBz2Decoder>
 	{
 		let config = self.resolve_config();
-		ParBz2Decoder::build(DataSource::Owned(data), config, self.verify_stream_crc, self.pool)
+		ParBz2Decoder::build(DataSource::Owned(data), config, self.verify_stream_crc, self.pool, self.on_progress)
 	}
 }
 
@@ -1199,5 +1507,261 @@ mod tests
 		let config = PipelineConfig::for_pool(&pool);
 		assert_eq!(config.result_channel_cap, 6); // 3 * 2
 		assert_eq!(config.output_channel_cap, 4);
+	}
+
+	// ── DecoderStats ──────────────────────────────────────────────
+
+	#[test]
+	fn test_stats_totals_single_stream()
+	{
+		let original = b"Hello, stats!";
+		let compressed = compress(original, 9);
+		let decoder = ParBz2Decoder::from_bytes(Arc::from(compressed.as_slice())).unwrap();
+		let stats = decoder.stats();
+		assert_eq!(stats.compressed_bytes_total(), compressed.len() as u64);
+		assert_eq!(stats.streams_total(), 1);
+		assert!(stats.blocks_total() >= 1);
+	}
+
+	#[test]
+	fn test_stats_after_full_read()
+	{
+		let original = b"Hello, world! This is a test of decoder statistics.";
+		let compressed = compress(original, 9);
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed.as_slice())).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+		assert_eq!(output.as_slice(), original);
+
+		let stats = decoder.stats();
+		assert_eq!(stats.decompressed_bytes(), original.len() as u64);
+		assert!(stats.blocks_completed() >= 1);
+		assert_eq!(stats.blocks_completed(), stats.blocks_total());
+		assert_eq!(stats.streams_completed(), 1);
+		assert_eq!(stats.streams_completed(), stats.streams_total());
+		assert!(stats.compressed_bits_consumed() > 0);
+		assert!(stats.elapsed().as_nanos() > 0);
+	}
+
+	#[test]
+	fn test_stats_progress()
+	{
+		let original = b"Some data for progress tracking.";
+		let compressed = compress(original, 9);
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed.as_slice())).unwrap();
+
+		// Before reading: progress should be 0.
+		assert_eq!(decoder.stats().progress(), 0.0);
+
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+
+		// After reading: progress should be 1.0.
+		assert_eq!(decoder.stats().progress(), 1.0);
+	}
+
+	#[test]
+	fn test_stats_snapshot()
+	{
+		let original = b"Snapshot test data";
+		let compressed = compress(original, 9);
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed.as_slice())).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+
+		let snap = decoder.stats().snapshot();
+		assert_eq!(snap.compressed_bytes_total, compressed.len() as u64);
+		assert_eq!(snap.decompressed_bytes, original.len() as u64);
+		assert_eq!(snap.blocks_completed, snap.blocks_total);
+		assert_eq!(snap.streams_completed, snap.streams_total);
+		assert!(snap.compressed_bits_consumed > 0);
+		assert_eq!(snap.progress(), 1.0);
+	}
+
+	#[test]
+	fn test_stats_multi_stream()
+	{
+		// Concatenate two bzip2 streams.
+		let data1 = b"First stream data.";
+		let data2 = b"Second stream data.";
+		let mut compressed = compress(data1, 9);
+		compressed.extend_from_slice(&compress(data2, 9));
+
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed.as_slice())).unwrap();
+		assert_eq!(decoder.stats().streams_total(), 2);
+
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+		let expected: Vec<u8> = [data1.as_slice(), data2.as_slice()].concat();
+		assert_eq!(output, expected);
+
+		let stats = decoder.stats();
+		assert_eq!(stats.streams_completed(), 2);
+		assert_eq!(stats.decompressed_bytes(), expected.len() as u64);
+		assert_eq!(stats.blocks_completed(), stats.blocks_total());
+	}
+
+	#[test]
+	fn test_stats_decompression_rate()
+	{
+		let stats = DecoderStats::new(100, 1, 1);
+		// Initially decompressed_bytes is 0 so rate should be 0.
+		assert_eq!(stats.decompression_rate(), 0.0);
+	}
+
+	#[test]
+	fn test_stats_snapshot_decompression_rate()
+	{
+		let snap = DecoderStatsSnapshot {
+			compressed_bytes_total: 100,
+			blocks_total: 1,
+			streams_total: 1,
+			decompressed_bytes: 1_000_000,
+			blocks_completed: 1,
+			streams_completed: 1,
+			compressed_bits_consumed: 800,
+			elapsed: Duration::from_secs(2),
+		};
+		let rate = snap.decompression_rate();
+		assert!((rate - 500_000.0).abs() < 0.1);
+		assert_eq!(snap.progress(), 1.0);
+	}
+
+	#[test]
+	fn test_stats_snapshot_zero_elapsed()
+	{
+		let snap = DecoderStatsSnapshot {
+			compressed_bytes_total: 100,
+			blocks_total: 1,
+			streams_total: 1,
+			decompressed_bytes: 500,
+			blocks_completed: 1,
+			streams_completed: 1,
+			compressed_bits_consumed: 800,
+			elapsed: Duration::ZERO,
+		};
+		assert_eq!(snap.decompression_rate(), 0.0);
+	}
+
+	#[test]
+	fn test_stats_progress_zero_blocks()
+	{
+		let stats = DecoderStats::new(0, 0, 0);
+		assert_eq!(stats.progress(), 0.0);
+	}
+
+	#[test]
+	fn test_stats_debug_impl()
+	{
+		let stats = DecoderStats::new(100, 5, 2);
+		let debug = format!("{:?}", stats);
+		assert!(debug.contains("DecoderStats"));
+		assert!(debug.contains("compressed_bytes_total: 100"));
+		assert!(debug.contains("blocks_total: 5"));
+		assert!(debug.contains("streams_total: 2"));
+	}
+
+	#[test]
+	fn test_stats_arc_cloneable()
+	{
+		let original = b"Arc clone test";
+		let compressed = compress(original, 9);
+		let decoder = ParBz2Decoder::from_bytes(Arc::from(compressed.as_slice())).unwrap();
+		// The stats Arc can be cloned for use from another thread.
+		let stats_clone = Arc::clone(decoder.stats());
+		assert_eq!(stats_clone.compressed_bytes_total(), compressed.len() as u64);
+	}
+
+	#[test]
+	fn test_on_progress_callback()
+	{
+		use std::sync::atomic::{AtomicU64, Ordering};
+
+		let call_count = Arc::new(AtomicU64::new(0));
+		let last_blocks = Arc::new(AtomicU64::new(0));
+		let cc = Arc::clone(&call_count);
+		let lb = Arc::clone(&last_blocks);
+
+		let original = b"Callback test data.";
+		let compressed = compress(original, 9);
+
+		let mut decoder = ParBz2Decoder::builder()
+			.on_progress(move |stats| {
+				cc.fetch_add(1, Ordering::Relaxed);
+				lb.store(stats.blocks_completed(), Ordering::Relaxed);
+			})
+			.from_bytes(Arc::from(compressed.as_slice()))
+			.unwrap();
+
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+		assert_eq!(output.as_slice(), original);
+
+		// Callback should have been called at least once (once per block).
+		assert!(call_count.load(Ordering::Relaxed) >= 1);
+		assert!(last_blocks.load(Ordering::Relaxed) >= 1);
+	}
+
+	#[test]
+	fn test_builder_on_progress_is_cloneable()
+	{
+		let builder = ParBz2Decoder::builder().on_progress(|_stats| {});
+		let _clone = builder.clone();
+	}
+
+	#[test]
+	fn test_builder_on_progress_is_debuggable()
+	{
+		let builder = ParBz2Decoder::builder().on_progress(|_stats| {});
+		let debug = format!("{:?}", builder);
+		assert!(debug.contains("ParBz2DecoderBuilder"));
+	}
+
+	#[test]
+	fn test_stats_snapshot_progress_zero_blocks()
+	{
+		let snap = DecoderStatsSnapshot {
+			compressed_bytes_total: 0,
+			blocks_total: 0,
+			streams_total: 0,
+			decompressed_bytes: 0,
+			blocks_completed: 0,
+			streams_completed: 0,
+			compressed_bits_consumed: 0,
+			elapsed: Duration::from_secs(1),
+		};
+		assert_eq!(snap.progress(), 0.0);
+	}
+
+	#[test]
+	fn test_stats_snapshot_decompression_rate_zero_elapsed()
+	{
+		// Redundant with test_stats_snapshot_zero_elapsed but explicitly
+		// targets the DecoderStatsSnapshot::decompression_rate() path.
+		let snap = DecoderStatsSnapshot {
+			compressed_bytes_total: 100,
+			blocks_total: 1,
+			streams_total: 1,
+			decompressed_bytes: 5000,
+			blocks_completed: 1,
+			streams_completed: 1,
+			compressed_bits_consumed: 800,
+			elapsed: Duration::ZERO,
+		};
+		assert_eq!(snap.decompression_rate(), 0.0);
+	}
+
+	#[test]
+	fn test_stats_decompression_rate_after_read()
+	{
+		let original = b"Rate test data.";
+		let compressed = compress(original, 9);
+		let mut decoder = ParBz2Decoder::from_bytes(Arc::from(compressed.as_slice())).unwrap();
+		let mut output = Vec::new();
+		decoder.read_to_end(&mut output).unwrap();
+
+		// After real decompression, rate should be positive.
+		let rate = decoder.stats().decompression_rate();
+		assert!(rate > 0.0, "decompression_rate should be > 0 after read, got {rate}");
 	}
 }

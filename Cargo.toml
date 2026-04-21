@@ -1,6 +1,6 @@
 [package]
 name = "parallel-bz2-redux"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
 description = "Correct, high-performance parallel bzip2 compression and decompression"
 repository = "https://github.com/slop-mopper/parallel-bz2-redux"

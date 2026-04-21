@@ -25,8 +25,10 @@
 pub(crate) mod block;
 pub(crate) mod pipeline;
 
+use std::fmt;
 use std::io::Write;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use rayon::ThreadPool;
 
@@ -41,6 +43,54 @@ use crate::error::Result;
 
 /// The 48-bit end-of-stream magic: `0x177245385090`.
 const EOS_MAGIC: u64 = 0x177245385090;
+
+// ── EncoderStatsSnapshot ───────────────────────────────────────────
+
+/// Frozen point-in-time snapshot of encoder statistics.
+///
+/// Obtained via [`ParBz2Encoder::stats_snapshot()`].  All fields are
+/// plain values so the snapshot is cheap to copy and pass around.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EncoderStatsSnapshot
+{
+	/// Total uncompressed bytes received via [`Write::write()`].
+	pub total_in: u64,
+	/// Total compressed bytes written to the inner writer.
+	pub total_out: u64,
+	/// Number of blocks compressed so far.
+	pub blocks_completed: u64,
+	/// Number of parallel compression batches flushed.
+	pub batches_completed: u64,
+	/// Wall-clock time elapsed since the encoder was created.
+	pub elapsed: Duration,
+}
+
+impl EncoderStatsSnapshot
+{
+	/// Compression ratio (`total_out / total_in`).
+	///
+	/// Returns `0.0` if no input has been received.
+	pub fn compression_ratio(&self) -> f64
+	{
+		if self.total_in == 0 {
+			return 0.0;
+		}
+		self.total_out as f64 / self.total_in as f64
+	}
+
+	/// Compression throughput in bytes per second, measured as
+	/// uncompressed input bytes divided by elapsed wall-clock time.
+	///
+	/// Returns `0.0` if no time has elapsed.
+	pub fn compression_rate(&self) -> f64
+	{
+		let secs = self.elapsed.as_secs_f64();
+		if secs == 0.0 {
+			return 0.0;
+		}
+		self.total_in as f64 / secs
+	}
+}
 
 // ── ParBz2Encoder ──────────────────────────────────────────────────
 
@@ -101,6 +151,14 @@ pub struct ParBz2Encoder<W: Write>
 	panicked: bool,
 	/// Custom Rayon thread pool for parallel block compression.
 	pool: Option<Arc<ThreadPool>>,
+	/// Number of blocks compressed so far.
+	blocks_completed: u64,
+	/// Number of parallel compression batches flushed.
+	batches_completed: u64,
+	/// Wall-clock time when the encoder was created.
+	start_time: Instant,
+	/// Optional progress callback, invoked after each parallel batch.
+	on_progress: Option<Arc<dyn Fn(&EncoderStatsSnapshot) + Send + Sync>>,
 }
 
 impl<W: Write> ParBz2Encoder<W>
@@ -138,6 +196,10 @@ impl<W: Write> ParBz2Encoder<W>
 			done: false,
 			panicked: false,
 			pool: None,
+			blocks_completed: 0,
+			batches_completed: 0,
+			start_time: Instant::now(),
+			on_progress: None,
 		})
 	}
 
@@ -172,6 +234,60 @@ impl<W: Write> ParBz2Encoder<W>
 	pub fn total_out(&self) -> u64
 	{
 		self.total_out
+	}
+
+	/// Number of blocks compressed so far.
+	pub fn blocks_completed(&self) -> u64
+	{
+		self.blocks_completed
+	}
+
+	/// Number of parallel compression batches flushed so far.
+	pub fn batches_completed(&self) -> u64
+	{
+		self.batches_completed
+	}
+
+	/// Wall-clock time elapsed since the encoder was created.
+	pub fn elapsed(&self) -> Duration
+	{
+		self.start_time.elapsed()
+	}
+
+	/// Compression ratio (`total_out / total_in`).
+	///
+	/// Returns `0.0` if no input has been received.
+	pub fn compression_ratio(&self) -> f64
+	{
+		if self.total_in == 0 {
+			return 0.0;
+		}
+		self.total_out as f64 / self.total_in as f64
+	}
+
+	/// Compression throughput in bytes per second, measured as
+	/// uncompressed input bytes divided by elapsed wall-clock time.
+	///
+	/// Returns `0.0` if no time has elapsed.
+	pub fn compression_rate(&self) -> f64
+	{
+		let secs = self.elapsed().as_secs_f64();
+		if secs == 0.0 {
+			return 0.0;
+		}
+		self.total_in as f64 / secs
+	}
+
+	/// Create a frozen point-in-time snapshot of all encoder statistics.
+	pub fn stats_snapshot(&self) -> EncoderStatsSnapshot
+	{
+		EncoderStatsSnapshot {
+			total_in: self.total_in,
+			total_out: self.total_out,
+			blocks_completed: self.blocks_completed,
+			batches_completed: self.batches_completed,
+			elapsed: self.elapsed(),
+		}
 	}
 
 	/// Finalize the bzip2 stream and return the inner writer.
@@ -214,6 +330,7 @@ impl<W: Write> ParBz2Encoder<W>
 			self.output.copy_bits_from(&block.bits, 0, block.bit_len);
 			self.stream_crc = combine_stream_crc(self.stream_crc, block.block_crc);
 			self.buffer.clear();
+			self.blocks_completed += 1;
 		}
 
 		// ── EOS marker + stream CRC + padding ──────────────────────
@@ -265,12 +382,19 @@ impl<W: Write> ParBz2Encoder<W>
 			self.stream_crc = combine_stream_crc(self.stream_crc, block.block_crc);
 		}
 
+		self.blocks_completed += blocks.len() as u64;
+		self.batches_completed += 1;
+
 		self.buffer.drain(..n_bytes);
 
 		// Flush complete bytes to inner writer.
 		let inner = self.inner.as_mut().expect("inner writer already taken");
 		let flushed = self.output.flush_to(inner)?;
 		self.total_out += flushed as u64;
+
+		if let Some(ref cb) = self.on_progress {
+			cb(&self.stats_snapshot());
+		}
 
 		Ok(())
 	}
@@ -334,12 +458,38 @@ impl<W: Write> Drop for ParBz2Encoder<W>
 /// encoder.write_all(b"test").unwrap();
 /// encoder.finish().unwrap();
 /// ```
-#[derive(Debug, Clone)]
 pub struct ParBz2EncoderBuilder
 {
 	level: u8,
 	min_blocks: Option<usize>,
 	pool: Option<Arc<ThreadPool>>,
+	on_progress: Option<Arc<dyn Fn(&EncoderStatsSnapshot) + Send + Sync>>,
+}
+
+impl fmt::Debug for ParBz2EncoderBuilder
+{
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
+	{
+		f.debug_struct("ParBz2EncoderBuilder")
+			.field("level", &self.level)
+			.field("min_blocks", &self.min_blocks)
+			.field("pool", &self.pool)
+			.field("on_progress", &self.on_progress.as_ref().map(|_| ".."))
+			.finish()
+	}
+}
+
+impl Clone for ParBz2EncoderBuilder
+{
+	fn clone(&self) -> Self
+	{
+		Self {
+			level: self.level,
+			min_blocks: self.min_blocks,
+			pool: self.pool.clone(),
+			on_progress: self.on_progress.clone(),
+		}
+	}
 }
 
 impl ParBz2EncoderBuilder
@@ -347,7 +497,7 @@ impl ParBz2EncoderBuilder
 	/// Create a new builder with default settings (level 9).
 	pub fn new() -> Self
 	{
-		Self { level: 9, min_blocks: None, pool: None }
+		Self { level: 9, min_blocks: None, pool: None, on_progress: None }
 	}
 
 	/// Set the compression level (`1`–`9`).
@@ -386,6 +536,32 @@ impl ParBz2EncoderBuilder
 		self
 	}
 
+	/// Register a progress callback invoked after each parallel
+	/// compression batch completes.
+	///
+	/// The callback runs on the thread that calls [`Write::write()`],
+	/// so it does not interfere with the parallel compression workers.
+	///
+	/// ```
+	/// use std::io::Write;
+	/// use parallel_bz2_redux::compress::ParBz2EncoderBuilder;
+	///
+	/// let mut output = Vec::new();
+	/// let mut encoder = ParBz2EncoderBuilder::new()
+	///     .on_progress(|snap| {
+	///         eprintln!("compressed {} blocks", snap.blocks_completed);
+	///     })
+	///     .build(&mut output)
+	///     .unwrap();
+	/// encoder.write_all(b"test").unwrap();
+	/// encoder.finish().unwrap();
+	/// ```
+	pub fn on_progress(mut self, cb: impl Fn(&EncoderStatsSnapshot) + Send + Sync + 'static) -> Self
+	{
+		self.on_progress = Some(Arc::new(cb));
+		self
+	}
+
 	/// Build the encoder, writing compressed output to `inner`.
 	///
 	/// # Errors
@@ -399,6 +575,7 @@ impl ParBz2EncoderBuilder
 			.unwrap_or_else(|| self.pool.as_ref().map_or(rayon::current_num_threads(), |p| p.current_num_threads()));
 		enc.min_blocks = min_blocks;
 		enc.pool = self.pool;
+		enc.on_progress = self.on_progress;
 		Ok(enc)
 	}
 }
@@ -994,5 +1171,195 @@ mod tests
 		let mut output = Vec::new();
 		decoder.read_to_end(&mut output).unwrap();
 		assert_eq!(output, original);
+	}
+
+	// ── EncoderStats ──────────────────────────────────────────────
+
+	#[test]
+	fn test_encoder_stats_initial()
+	{
+		let mut buf = Vec::new();
+		let enc = ParBz2Encoder::new(&mut buf, 9).unwrap();
+		assert_eq!(enc.blocks_completed(), 0);
+		assert_eq!(enc.batches_completed(), 0);
+		assert_eq!(enc.total_in(), 0);
+		assert_eq!(enc.total_out(), 0);
+		assert_eq!(enc.compression_ratio(), 0.0);
+		// elapsed() should return a valid duration (just verify it doesn't panic).
+		let _ = enc.elapsed();
+	}
+
+	#[test]
+	fn test_encoder_stats_after_finish()
+	{
+		let original = b"Stats test: small data.";
+		let mut compressed = Vec::new();
+		let mut enc = ParBz2Encoder::new(&mut compressed, 9).unwrap();
+		enc.write_all(original).unwrap();
+		// Before finish, the partial block hasn't been compressed yet.
+		assert_eq!(enc.total_in(), original.len() as u64);
+		enc.try_finish().unwrap();
+
+		// After finish, at least one block should be completed.
+		assert!(enc.blocks_completed() >= 1);
+		assert!(enc.total_out() > 0);
+		assert!(enc.compression_ratio() > 0.0);
+	}
+
+	#[test]
+	fn test_encoder_stats_snapshot()
+	{
+		let original = b"Snapshot test data.";
+		let mut compressed = Vec::new();
+		let mut enc = ParBz2Encoder::new(&mut compressed, 9).unwrap();
+		enc.write_all(original).unwrap();
+		enc.try_finish().unwrap();
+
+		let snap = enc.stats_snapshot();
+		assert_eq!(snap.total_in, original.len() as u64);
+		assert_eq!(snap.total_out, enc.total_out());
+		assert_eq!(snap.blocks_completed, enc.blocks_completed());
+		assert_eq!(snap.batches_completed, enc.batches_completed());
+		assert!(snap.elapsed.as_nanos() > 0);
+		assert!(snap.compression_ratio() > 0.0);
+	}
+
+	#[test]
+	fn test_encoder_stats_multi_block()
+	{
+		// Use level 1 (smallest blocks: ~100KB) with enough data to force multiple blocks.
+		let block_size = max_block_bytes(1);
+		let original = vec![0xABu8; block_size * 3 + 1000];
+		let mut compressed = Vec::new();
+		{
+			let mut enc = ParBz2EncoderBuilder::new()
+				.level(1)
+				.min_blocks(1)
+				.build(&mut compressed)
+				.unwrap();
+			enc.write_all(&original).unwrap();
+			enc.try_finish().unwrap();
+
+			// Should have compressed at least 3 blocks + 1 partial.
+			assert!(enc.blocks_completed() >= 4, "blocks_completed = {}", enc.blocks_completed());
+			assert!(enc.batches_completed() >= 1);
+		}
+	}
+
+	#[test]
+	fn test_encoder_stats_snapshot_compression_rate()
+	{
+		use std::time::Duration;
+		let snap = EncoderStatsSnapshot {
+			total_in: 1_000_000,
+			total_out: 500_000,
+			blocks_completed: 10,
+			batches_completed: 2,
+			elapsed: Duration::from_secs(2),
+		};
+		let rate = snap.compression_rate();
+		assert!((rate - 500_000.0).abs() < 0.1);
+		assert!((snap.compression_ratio() - 0.5).abs() < 0.001);
+	}
+
+	#[test]
+	fn test_encoder_stats_snapshot_zero_elapsed()
+	{
+		use std::time::Duration;
+		let snap = EncoderStatsSnapshot {
+			total_in: 1000,
+			total_out: 500,
+			blocks_completed: 1,
+			batches_completed: 1,
+			elapsed: Duration::ZERO,
+		};
+		assert_eq!(snap.compression_rate(), 0.0);
+	}
+
+	#[test]
+	fn test_encoder_stats_snapshot_zero_input()
+	{
+		use std::time::Duration;
+		let snap = EncoderStatsSnapshot {
+			total_in: 0,
+			total_out: 0,
+			blocks_completed: 0,
+			batches_completed: 0,
+			elapsed: Duration::from_secs(1),
+		};
+		assert_eq!(snap.compression_ratio(), 0.0);
+		assert_eq!(snap.compression_rate(), 0.0);
+	}
+
+	#[test]
+	fn test_encoder_on_progress_callback()
+	{
+		use std::sync::atomic::{AtomicU64, Ordering};
+
+		let call_count = Arc::new(AtomicU64::new(0));
+		let last_blocks = Arc::new(AtomicU64::new(0));
+		let cc = Arc::clone(&call_count);
+		let lb = Arc::clone(&last_blocks);
+
+		// Use level 1 + min_blocks 1 to trigger callbacks per batch.
+		let block_size = max_block_bytes(1);
+		let original = vec![0xCDu8; block_size * 3 + 500];
+		let mut compressed = Vec::new();
+		{
+			let mut enc = ParBz2EncoderBuilder::new()
+				.level(1)
+				.min_blocks(1)
+				.on_progress(move |snap| {
+					cc.fetch_add(1, Ordering::Relaxed);
+					lb.store(snap.blocks_completed, Ordering::Relaxed);
+				})
+				.build(&mut compressed)
+				.unwrap();
+			enc.write_all(&original).unwrap();
+			enc.try_finish().unwrap();
+		}
+
+		// The callback should have been called at least once.
+		assert!(call_count.load(Ordering::Relaxed) >= 1);
+		assert!(last_blocks.load(Ordering::Relaxed) >= 1);
+	}
+
+	#[test]
+	fn test_encoder_builder_on_progress_is_cloneable()
+	{
+		let builder = ParBz2EncoderBuilder::new().on_progress(|_snap| {});
+		let _clone = builder.clone();
+	}
+
+	#[test]
+	fn test_encoder_builder_on_progress_is_debuggable()
+	{
+		let builder = ParBz2EncoderBuilder::new().on_progress(|_snap| {});
+		let debug = format!("{:?}", builder);
+		assert!(debug.contains("ParBz2EncoderBuilder"));
+	}
+
+	#[test]
+	fn test_encoder_compression_rate_after_finish()
+	{
+		let original = b"Compression rate test data with enough content.";
+		let mut compressed = Vec::new();
+		let mut enc = ParBz2Encoder::new(&mut compressed, 9).unwrap();
+		enc.write_all(original).unwrap();
+		enc.try_finish().unwrap();
+
+		// After some real work, compression_rate should be positive.
+		let rate = enc.compression_rate();
+		assert!(rate > 0.0, "compression_rate should be > 0 after encoding, got {rate}");
+	}
+
+	#[test]
+	fn test_encoder_compression_rate_no_data()
+	{
+		// Immediately after construction, total_in is 0 so rate should be 0.
+		let mut buf = Vec::new();
+		let enc = ParBz2Encoder::new(&mut buf, 9).unwrap();
+		// Even though elapsed > 0, total_in == 0, so 0.0 / elapsed == 0.0.
+		assert_eq!(enc.compression_rate(), 0.0);
 	}
 }
