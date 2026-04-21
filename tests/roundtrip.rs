@@ -1,5 +1,5 @@
 // tests/roundtrip.rs
-// SPDX-License-Identifier: Unlicense
+// SPDX-License-Identifier: CC0-1.0
 // This file was created entirely or mostly by an AI tool: claude-opus-4-6
 //
 // Integration tests: compress with the bzip2 crate, decompress with

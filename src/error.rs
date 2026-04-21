@@ -1,5 +1,5 @@
 // error.rs
-// SPDX-License-Identifier: Unlicense
+// SPDX-License-Identifier: CC0-1.0
 // This file was created entirely or mostly by an AI tool: claude-opus-4-6
 
 //! Error types for the parallel bzip2 library.
